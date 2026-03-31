@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+
+# Model weights (16M)
+YangCCS21/model/checkpoint/
+
+# Dataset (symlink to external KITTI)
+YangCCS21/data/
+
+# OpenPCDet build artifacts & compiled extensions
+OpenPCDet/build/
+OpenPCDet/data/
+**/*.so
+
+# OS
+.DS_Store
+Thumbs.db

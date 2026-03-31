@@ -1,0 +1,83 @@
+# Attack configuration for AsiaCCS 2021 — Appearing Attack
+# Target: PointRCNN (white-box), PointPillar/PV-RCNN (black-box)
+# Design: single-stage RPN-level optimization (inspired by Tu et al. CVPR 2020)
+
+data:
+  kitti_root: data/kitti
+  split: val
+  pc_range: [0.0, -40.0, -2.5, 70.4, 40.0, 1.0]
+
+model:
+  pointrcnn_config: /mnt/file-206-user-disk-m/cpii.local/qli/carbu/OpenPCDet/tools/cfgs/kitti_models/pointrcnn.yaml
+  pointrcnn_ckpt: model/checkpoint/pointrcnn_7870.pth
+  score_thresh: 0.3
+  nms_thresh: 0.1
+
+attack:
+  mode: whitebox          # whitebox or blackbox
+  n_iters: 1000
+  lr: 0.02
+  optimizer: adam
+  mesh_subdivisions: 2    # 162 vertices, 320 faces
+  size_limit: [1.2, 0.8, 0.7]     # meters half-extent — physical printing constraint
+  translation_limit: [0.3, 0.3, 0.0]
+  grad_scale: 10.0                # amplify gradient through differentiable renderer
+
+  # Loss weights — single-stage, all RPN-level
+  # L = L_cls + beta_loc*L_loc + beta_size*L_size + alpha_feat*L_feat + lambda_lap*L_lap
+  loss_weights:
+    kappa: 2.0             # CW margin (round1=5.0, round3: 降低让 L_cls 更早饱和)
+    alpha_feat: 0.1        # L_feat: pull backbone features toward real car features
+    beta_loc: 0.5          # L_loc: align RPN box centers to injection position (CRITICAL)
+    beta_size: 0.0         # L_size: 关闭 (round1=0.2, 实验证明不可优化)
+    lambda_lap: 0.001      # L_lap: Laplacian mesh smoothing (from CVPR 2020)
+
+  multi_frame_batch: 8
+  phantom_box_size: [3.9, 1.6, 1.56]  # typical KITTI car dimensions (for L_size target)
+
+  # Injection settings
+  injection:
+    x_range: [5, 25]
+    y_range: [-10, 10]
+    resolution: 0.5
+    min_clearance: 1.5
+    fallback_pos: [4.0, -2.0, 0.0]
+    margin: 0.5  # GT box margin in BEV occupancy
+
+  # Direct point optimisation settings
+  pointopt:
+    n_points: 400           # number of adversarial points (vs ~150 from mesh)
+    n_iters: 1500           # round3: 1500 warm-start from round1
+    lr: 0.01                # round3: 中等学习率 (round1=0.02)
+    multi_frame_batch: 8
+    init: gt                # 'gt' = from GT car scans, 'box' = car-surface box
+    lambda_uni: 0.001       # uniformity regulariser weight
+
+  # Black-box CMA-ES settings (direct point optimisation)
+  blackbox:
+    n_points: 200           # fewer than whitebox (400) for CMA-ES efficiency
+    init: gt                # 'gt' = from GT car scans, 'box' = car-surface box
+    sigma0: 0.15            # 直接点空间，无 sigmoid 压缩，不需要大 sigma
+    popsize: 48             # CMA-ES recommended ~4+3*ln(600)≈23, 48 足够
+    maxiter: 300
+    tolfun: 1e-8
+    diagonal: true          # CMA_diagonal 模式，高维搜索更高效
+    n_eval_samples: 8       # frames per candidate per generation (early-term 会跳过差的)
+
+  # LiDAR ray parameters (Velodyne HDL-64E)
+  lidar:
+    n_elevation: 64
+    elev_min_deg: -24.9
+    elev_max_deg: 2.0
+    h_step_deg: 0.08
+    ray_margin_deg: 2.0
+
+eval:
+  iou_thresh: 0.1         # For appearing attack: low IoU with phantom box
+  iou_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+  proximity_thresh: 1.5   # meters from injection pos
+
+# Reference feature settings
+ref_feature:
+  n_instances: 500
+  output_path: results/ref_car_feature.pt
