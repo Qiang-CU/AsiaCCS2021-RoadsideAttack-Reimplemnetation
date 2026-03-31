@@ -46,12 +46,20 @@ attack:
 
   # Direct point optimisation settings
   pointopt:
-    n_points: 400           # number of adversarial points (vs ~150 from mesh)
+    n_points: 1000          # 1000 points for denser coverage + better Poisson reconstruction
     n_iters: 1500           # round3: 1500 warm-start from round1
     lr: 0.01                # round3: 中等学习率 (round1=0.02)
     multi_frame_batch: 8
-    init: gt                # 'gt' = from GT car scans, 'box' = car-surface box
+    init: box               # 'box' = complete closed car-surface box (all 6 faces)
     lambda_uni: 0.001       # uniformity regulariser weight
+    # Physical realizability constraints (AAAI 2020 pipeline)
+    physical:
+      enabled: true         # Chamfer+kNN+NormalProj for printable objects
+      lambda_cd: 0.1        # Chamfer distance to initial shape
+      lambda_knn: 0.05      # kNN smoothing (uniform spacing for printability)
+      lambda_nproj: 0.1     # normal projection (prevent inward perturbation)
+      knn_k: 10             # k for kNN operations
+      noise_sigma: 0.02     # 点级别 EoT：每次前向给点坐标加 N(0, σ²) 噪声 (m)
 
   # Black-box CMA-ES settings (direct point optimisation)
   blackbox:

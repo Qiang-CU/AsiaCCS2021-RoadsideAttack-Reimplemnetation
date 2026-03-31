@@ -107,7 +107,7 @@ def reconstruct_mesh_from_points(points, method='convex_hull'):
     Methods:
       - convex_hull (default): scipy ConvexHull, always produces closed mesh
       - alpha: Open3D alpha shape, may have holes for sparse points
-      - poisson: Open3D Poisson, closed but may add extra volume
+      - poisson: Open3D Screened Poisson, closed watertight mesh (best for printing)
       - ball_pivoting: Open3D ball pivoting, usually open for sparse data
 
     Returns (vertices, faces) as numpy arrays.
@@ -142,10 +142,10 @@ def reconstruct_mesh_from_points(points, method='convex_hull'):
         )
     elif method == 'poisson':
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=6
+            pcd, depth=8
         )
         densities = np.asarray(densities)
-        thresh = np.quantile(densities, 0.1)
+        thresh = np.quantile(densities, 0.05)
         mesh.remove_vertices_by_mask(densities < thresh)
     elif method == 'alpha':
         distances = pcd.compute_nearest_neighbor_distance()
@@ -168,6 +168,194 @@ def reconstruct_mesh_from_points(points, method='convex_hull'):
         print(f'  WARNING: mesh is not watertight, consider using --mesh-method convex_hull')
 
     return verts, faces
+
+
+def poisson_reconstruct_and_clean(points, depth=8, min_component_faces=1024):
+    """
+    Screened Poisson reconstruction with small component removal.
+
+    Follows AAAI 2020 pipeline:
+      1. Estimate normals
+      2. Screened Poisson surface reconstruction
+      3. Remove connected components with < min_component_faces faces
+
+    Args:
+        points:              (N, 3) numpy array
+        depth:               Poisson octree depth (higher = finer detail)
+        min_component_faces: remove components smaller than this
+
+    Returns:
+        mesh:  Open3D TriangleMesh (watertight, cleaned)
+        verts: (V, 3) numpy array
+        faces: (F, 3) numpy array
+    """
+    import open3d as o3d
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.2, max_nn=30)
+    )
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth
+    )
+    densities = np.asarray(densities)
+    thresh = np.quantile(densities, 0.05)
+    mesh.remove_vertices_by_mask(densities < thresh)
+
+    n_faces_before = len(mesh.triangles)
+
+    triangle_clusters, cluster_n_tri, cluster_area = (
+        mesh.cluster_connected_triangles()
+    )
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_tri = np.asarray(cluster_n_tri)
+
+    small_cluster_mask = cluster_n_tri[triangle_clusters] < min_component_faces
+    mesh.remove_triangles_by_mask(small_cluster_mask)
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+
+    n_removed = n_faces_before - len(mesh.triangles)
+    n_clusters_removed = (cluster_n_tri < min_component_faces).sum()
+    print(f'  Poisson reconstruction: depth={depth}')
+    print(f'  Before cleanup: {n_faces_before} faces')
+    print(f'  Removed {n_clusters_removed} small components ({n_removed} faces)')
+    print(f'  After cleanup: {len(mesh.vertices)} verts, {len(mesh.triangles)} faces')
+    print(f'  Watertight: {mesh.is_watertight()}')
+
+    verts = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.triangles)
+    return mesh, verts, faces
+
+
+def sample_points_from_mesh(verts, faces, n_points, method='uniform'):
+    """
+    Sample points from a triangle mesh surface.
+
+    Args:
+        verts:    (V, 3) numpy array
+        faces:    (F, 3) numpy array (int indices)
+        n_points: number of points to sample
+        method:   'uniform' or 'poisson_disk'
+
+    Returns:
+        sampled_points: (n_points, 3) numpy array
+    """
+    try:
+        import open3d as o3d
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        mesh.compute_vertex_normals()
+
+        if method == 'poisson_disk':
+            pcd = mesh.sample_points_poisson_disk(n_points)
+        else:
+            pcd = mesh.sample_points_uniformly(n_points)
+        return np.asarray(pcd.points)
+    except ImportError:
+        pass
+
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    cross = np.cross(v1 - v0, v2 - v0)
+    areas = 0.5 * np.linalg.norm(cross, axis=1)
+    probs = areas / areas.sum()
+
+    chosen = np.random.choice(len(faces), size=n_points, p=probs)
+    r1 = np.sqrt(np.random.rand(n_points, 1))
+    r2 = np.random.rand(n_points, 1)
+    pts = (1 - r1) * v0[chosen] + r1 * (1 - r2) * v1[chosen] + r1 * r2 * v2[chosen]
+    return pts
+
+
+def closest_sample_points_from_mesh(adv_points, verts, faces):
+    """
+    AAAI 2020 "Closest" sampling: for each adversarial point, find the
+    closest point on the reconstructed mesh surface.
+
+    This preserves adversarial positioning far better than uniform sampling.
+
+    Args:
+        adv_points: (N, 3) numpy array — original adversarial points
+        verts:      (V, 3) numpy array — mesh vertices
+        faces:      (F, 3) numpy array — mesh face indices
+
+    Returns:
+        closest_pts: (N, 3) numpy array — points on mesh surface
+        distances:   (N,)   numpy array — distance from each adv point to surface
+    """
+    try:
+        import open3d as o3d
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+
+        scene = o3d.t.geometry.RaycastingScene()
+        mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+        scene.add_triangles(mesh_t)
+
+        query = o3d.core.Tensor(adv_points.astype(np.float32),
+                                dtype=o3d.core.Dtype.Float32)
+        result = scene.compute_closest_points(query)
+        closest_pts = result['points'].numpy()
+        distances = np.linalg.norm(closest_pts - adv_points, axis=1)
+
+        print(f'  Closest sampling: {len(adv_points)} points')
+        print(f'  Mean dist to surface: {distances.mean():.4f} m')
+        print(f'  Max  dist to surface: {distances.max():.4f} m')
+        return closest_pts, distances
+
+    except (ImportError, AttributeError):
+        print('  Open3D RaycastingScene unavailable, using triangle projection fallback')
+        return _closest_sample_fallback(adv_points, verts, faces)
+
+
+def _closest_sample_fallback(adv_points, verts, faces):
+    """Brute-force closest-point-on-triangle for each adversarial point."""
+    v0 = verts[faces[:, 0]]  # (F, 3)
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+
+    closest_pts = np.zeros_like(adv_points)
+    distances = np.full(len(adv_points), np.inf)
+
+    for i, p in enumerate(adv_points):
+        edge0 = v1 - v0
+        edge1 = v2 - v0
+        v0p = p[None, :] - v0
+
+        d00 = np.sum(edge0 * edge0, axis=1)
+        d01 = np.sum(edge0 * edge1, axis=1)
+        d11 = np.sum(edge1 * edge1, axis=1)
+        d20 = np.sum(v0p * edge0, axis=1)
+        d21 = np.sum(v0p * edge1, axis=1)
+        denom = d00 * d11 - d01 * d01
+        denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+        u = (d11 * d20 - d01 * d21) / denom
+        v = (d00 * d21 - d01 * d20) / denom
+
+        u = np.clip(u, 0, 1)
+        v = np.clip(v, 0, 1)
+        uv_sum = u + v
+        mask = uv_sum > 1
+        u[mask] = u[mask] / uv_sum[mask]
+        v[mask] = v[mask] / uv_sum[mask]
+
+        proj = v0 + u[:, None] * edge0 + v[:, None] * edge1
+        dists = np.linalg.norm(proj - p[None, :], axis=1)
+        best = np.argmin(dists)
+        closest_pts[i] = proj[best]
+        distances[i] = dists[best]
+
+    print(f'  Closest sampling (fallback): {len(adv_points)} points')
+    print(f'  Mean dist to surface: {distances.mean():.4f} m')
+    print(f'  Max  dist to surface: {distances.max():.4f} m')
+    return closest_pts, distances
 
 
 def export_pointopt_html(points, verts, faces, path,

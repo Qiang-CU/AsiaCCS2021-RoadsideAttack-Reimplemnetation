@@ -215,7 +215,7 @@ def mode_pointopt(config, device, warm_start_ckpt=None, devices=None):
         'L_cls': history['L_cls'],
         'L_loc': history['L_loc'],
     }
-    plot_loss_curve(loss_keys, save_path='results/pointopt_loss.png')
+    plot_loss_curve(loss_keys, save_path='results/whitebox_pointopt_loss.png')
 
 
 def mode_eval_pointopt(config, devices, ckpt_path):
@@ -326,6 +326,187 @@ def mode_blackbox(config, device, devices=None):
     print(f"  Best ASR: {history['best_asr'][-1]:.1%}" if history['best_asr'] else "")
     print(f"  Object size: {extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f} m")
     print(f"  Points: {len(pts_np)}")
+
+
+def mode_physical_verify(config, devices, ckpt_path, mesh_method='poisson',
+                         n_resample=None, sample_method='both'):
+    """
+    Physical verification pipeline (AAAI 2020 / AsiaCCS 2021):
+      1. Load optimized adversarial points
+      2. Surface reconstruction (Poisson / ConvexHull / etc.)
+      3. Remove small connected components (< 1024 faces)
+      4. Sample points from mesh: closest (AAAI 2020) and/or uniform
+      5. Inject into scenes and run detection
+      6. Compute and report ASR for each sampling strategy
+    """
+    print("=" * 60)
+    print("Physical Verification Pipeline")
+    print(f"  Checkpoint: {ckpt_path}")
+    print(f"  Mesh method: {mesh_method}")
+    print(f"  Sample method: {sample_method}")
+    print("=" * 60)
+
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    adv_pts = ckpt['adv_points'].numpy()
+    n_original = len(adv_pts)
+    extent = adv_pts.max(0) - adv_pts.min(0)
+    print(f"  Original points: {n_original}")
+    print(f"  Original size: {extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f} m")
+
+    from export_mesh import (poisson_reconstruct_and_clean,
+                             reconstruct_mesh_from_points,
+                             sample_points_from_mesh,
+                             closest_sample_points_from_mesh,
+                             export_obj, export_pointopt_html)
+
+    # Step 1-3: Reconstruct mesh
+    if mesh_method == 'poisson':
+        print("\nStep 1-3: Screened Poisson reconstruction + cleanup")
+        o3d_mesh, verts, faces = poisson_reconstruct_and_clean(
+            adv_pts, depth=8, min_component_faces=1024
+        )
+    else:
+        print(f"\nStep 1-3: {mesh_method} reconstruction")
+        verts, faces = reconstruct_mesh_from_points(adv_pts, method=mesh_method)
+
+    if len(faces) == 0:
+        print("ERROR: reconstruction produced 0 faces, cannot continue")
+        return
+
+    re_verts_extent = verts.max(0) - verts.min(0)
+    print(f"  Mesh size: {re_verts_extent[0]:.3f} x {re_verts_extent[1]:.3f}"
+          f" x {re_verts_extent[2]:.3f} m")
+
+    # Export mesh for inspection
+    os.makedirs('results', exist_ok=True)
+    mesh_dir = 'results/mesh_export'
+    os.makedirs(mesh_dir, exist_ok=True)
+    obj_path = os.path.join(mesh_dir, 'physical_reconstructed.obj')
+    export_obj(verts, faces, obj_path, f'{mesh_method} reconstructed')
+
+    # Build wrappers and dataset once
+    from evaluation.metrics_pointopt import compute_pointopt_asr
+    wrappers = build_multi_gpu_wrappers(config, devices)
+    dataset = get_dataset(config)
+
+    # Evaluate original ASR first
+    print(f"\nStep 4: Evaluating original (pre-reconstruction) ASR...")
+    asr_orig, stats_orig = compute_pointopt_asr(
+        dataset=dataset, adv_points_ckpt=ckpt_path,
+        config=config, device=str(devices[0]),
+        devices=devices, wrappers=wrappers,
+    )
+    print(f"  Original ASR: {stats_orig['n_success']}/{stats_orig['n_eligible']}"
+          f" = {asr_orig*100:.1f}%")
+
+    # Determine which sampling methods to run
+    methods_to_run = []
+    if sample_method == 'both':
+        methods_to_run = ['closest', 'uniform']
+    else:
+        methods_to_run = [sample_method]
+
+    if n_resample is None:
+        n_resample = n_original
+
+    results_by_method = {}
+
+    for sm in methods_to_run:
+        print(f"\n{'='*60}")
+        print(f"  Sampling: {sm} ({n_resample} points)")
+        print(f"{'='*60}")
+
+        if sm == 'closest':
+            resampled_pts, surf_dists = closest_sample_points_from_mesh(
+                adv_pts, verts, faces)
+        else:
+            resampled_pts = sample_points_from_mesh(verts, faces, n_resample)
+
+        resampled_pts = resampled_pts - resampled_pts.mean(0)
+        re_extent = resampled_pts.max(0) - resampled_pts.min(0)
+        print(f"  Resampled size: {re_extent[0]:.3f} x {re_extent[1]:.3f}"
+              f" x {re_extent[2]:.3f} m")
+
+        ckpt_tag = f'adv_points_physical_{sm}.pth'
+        resampled_ckpt_path = f'results/{ckpt_tag}'
+        torch.save({
+            'adv_points': torch.tensor(resampled_pts, dtype=torch.float32),
+            'method': f'physical_verify_{sm}',
+            'original_ckpt': ckpt_path,
+            'mesh_method': mesh_method,
+            'sample_method': sm,
+            'n_original': n_original,
+            'n_resampled': n_resample,
+        }, resampled_ckpt_path)
+
+        html_path = os.path.join(mesh_dir, f'physical_{sm}.html')
+        export_pointopt_html(resampled_pts, verts, faces, html_path,
+                             f'Physical Verify — {sm} sampling')
+
+        print(f"  Evaluating ASR ({sm})...")
+        asr, stats = compute_pointopt_asr(
+            dataset=dataset, adv_points_ckpt=resampled_ckpt_path,
+            config=config, device=str(devices[0]),
+            devices=devices, wrappers=wrappers,
+        )
+
+        retention = (asr / max(asr_orig, 1e-6)) * 100
+        results_by_method[sm] = {
+            'asr': asr,
+            'asr_pct': f'{asr*100:.1f}%',
+            'n_success': stats['n_success'],
+            'n_eligible': stats['n_eligible'],
+            'n_points': len(resampled_pts),
+            'retention_pct': f'{retention:.1f}%',
+            'object_size_m': {
+                'x': round(float(re_extent[0]), 3),
+                'y': round(float(re_extent[1]), 3),
+                'z': round(float(re_extent[2]), 3),
+            },
+        }
+        if sm == 'closest':
+            results_by_method[sm]['mean_surface_dist'] = round(float(surf_dists.mean()), 4)
+            results_by_method[sm]['max_surface_dist'] = round(float(surf_dists.max()), 4)
+
+        print(f"  {sm} ASR: {stats['n_success']}/{stats['n_eligible']}"
+              f" = {asr*100:.1f}% (retention: {retention:.1f}%)")
+
+    # Save combined results
+    result_summary = {
+        'original': {
+            'asr': asr_orig,
+            'asr_pct': f'{asr_orig*100:.1f}%',
+            'n_success': stats_orig['n_success'],
+            'n_eligible': stats_orig['n_eligible'],
+            'n_points': n_original,
+            'object_size_m': {
+                'x': round(float(extent[0]), 3),
+                'y': round(float(extent[1]), 3),
+                'z': round(float(extent[2]), 3),
+            },
+        },
+        'mesh': {
+            'method': mesh_method,
+            'verts': len(verts),
+            'faces': len(faces),
+        },
+        'sampling_results': results_by_method,
+    }
+
+    with open('results/physical_verify_results.json', 'w') as f:
+        json.dump(result_summary, f, indent=2, ensure_ascii=False)
+
+    print(f"\n{'='*60}")
+    print(f"  Physical Verification Summary")
+    print(f"{'='*60}")
+    print(f"  Original ASR:  {stats_orig['n_success']}/{stats_orig['n_eligible']}"
+          f" = {asr_orig*100:.1f}%")
+    print(f"  Mesh: {mesh_method}, {len(verts)} verts, {len(faces)} faces")
+    for sm, r in results_by_method.items():
+        print(f"  {sm:8s} ASR: {r['n_success']}/{r['n_eligible']}"
+              f" = {r['asr_pct']} (retention: {r['retention_pct']})")
+    print(f"  Results: results/physical_verify_results.json")
+    print(f"  Mesh:    {obj_path}")
 
 
 def mode_eval(config, devices, ckpt_path):
@@ -519,12 +700,21 @@ def main():
     parser.add_argument('--mode', required=True,
                         choices=['test_inference', 'precompute', 'whitebox',
                                  'pointopt', 'blackbox', 'eval',
-                                 'eval_pointopt', 'recall_iou', 'defenses'])
+                                 'eval_pointopt', 'recall_iou', 'defenses',
+                                 'physical_verify'])
     parser.add_argument('--config', default='configs/attack_config.yaml')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--gpu', default=None,
                         help='Comma-separated GPU IDs for multi-GPU, e.g. 0,1,2,3')
     parser.add_argument('--ckpt', default=None, help='Path to adv mesh checkpoint')
+    parser.add_argument('--mesh-method', default='poisson',
+                        choices=['poisson', 'convex_hull', 'alpha', 'ball_pivoting'],
+                        help='Mesh reconstruction method for physical_verify')
+    parser.add_argument('--n-resample', type=int, default=None,
+                        help='Number of points to resample from mesh (default: same as original)')
+    parser.add_argument('--sample-method', default='both',
+                        choices=['closest', 'uniform', 'both'],
+                        help='Sampling strategy: closest (AAAI20), uniform, or both')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -575,6 +765,15 @@ def main():
             sys.exit(1)
         devices = _parse_devices(args)
         mode_eval_defenses(config, devices, args.ckpt)
+    elif args.mode == 'physical_verify':
+        if not args.ckpt:
+            print("ERROR: --ckpt required for physical_verify mode")
+            sys.exit(1)
+        devices = _parse_devices(args)
+        mode_physical_verify(config, devices, args.ckpt,
+                             mesh_method=args.mesh_method,
+                             n_resample=args.n_resample,
+                             sample_method=args.sample_method)
 
 
 if __name__ == '__main__':

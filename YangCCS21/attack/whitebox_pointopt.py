@@ -29,6 +29,10 @@ from attack.inject import (
     inject_points, get_injection_metadata,
 )
 from attack.loss import L_cls, L_feat, L_rpn_box_loc, L_rpn_box_size
+from attack.physical_constraints import (
+    chamfer_distance, knn_smoothing_loss,
+    estimate_normals_knn, normal_projection_loss,
+)
 from model.pointrcnn_wrapper import PointRCNNWrapper
 
 
@@ -240,7 +244,8 @@ def precompute_injections(dataset, inj_cfg, rng=None):
 # ---------------------------------------------------------------------------
 
 def _forward_one_frame(wrapper, dataset, frame_idx, injection_cache,
-                       adv_points, device, rpn_only=True, run_post=False):
+                       adv_points, device, rpn_only=True, run_post=False,
+                       noise_sigma=0.0):
     """
     Forward pass: inject adv_points into scene → PointRCNN → RPN outputs.
 
@@ -253,6 +258,7 @@ def _forward_one_frame(wrapper, dataset, frame_idx, injection_cache,
         device:          torch device
         rpn_only:        skip RCNN head
         run_post:        run post_processing
+        noise_sigma:     point-level EoT noise std (meters), 0 = disabled
 
     Returns:
         dict with 'result', 'n_scene', 'n_adv', 'inj_pos', or None
@@ -264,9 +270,13 @@ def _forward_one_frame(wrapper, dataset, frame_idx, injection_cache,
         sample['pointcloud'], dtype=torch.float32, device=device
     )
 
-    # inject_points translates adv_points by injection_pos and concatenates
+    pts_for_inject = adv_points
+    if noise_sigma > 0 and adv_points.requires_grad:
+        noise = torch.randn_like(adv_points) * noise_sigma
+        pts_for_inject = adv_points + noise
+
     merged_pc, n_adv = inject_points(
-        pc_tensor, adv_points, inj_pos, remove_overlap=True,
+        pc_tensor, pts_for_inject, inj_pos, remove_overlap=True,
     )
 
     if n_adv == 0:
@@ -323,12 +333,19 @@ def pointopt_loss(point_cls_logits, rpn_box_preds, point_features,
                   n_scene, n_adv, injection_pos, device,
                   kappa=5.0, alpha_feat=0.1, beta_loc=0.5,
                   beta_size=0.2, lambda_uni=0.001,
-                  target_size=(3.9, 1.6, 1.56)):
+                  target_size=(3.9, 1.6, 1.56),
+                  pts_init=None, normals_init=None,
+                  lambda_cd=0.0, lambda_knn=0.0, lambda_nproj=0.0,
+                  knn_k=10):
     """
     Direct point optimisation loss.
 
     Same RPN-level terms as appearing_loss, but replaces Laplacian mesh
-    smoothing with a point uniformity regulariser.
+    smoothing with a point uniformity regulariser.  When physical
+    constraint weights are > 0, additionally computes:
+      - L_cd:    Chamfer distance to initial points
+      - L_knn:   kNN smoothing (uniform spacing)
+      - L_nproj: normal projection (prevent inward movement)
 
     Returns:
         total_loss, loss_dict
@@ -347,13 +364,30 @@ def pointopt_loss(point_cls_logits, rpn_box_preds, point_features,
              + lambda_uni * l_uni)
 
     loss_dict = {
-        'L_total': total.item(),
+        'L_total': 0.0,
         'L_cls': l_cls.item(),
         'L_loc': l_loc.item(),
         'L_size': l_size.item(),
         'L_feat': l_feat.item(),
         'L_uni': l_uni.item(),
     }
+
+    if lambda_cd > 0 and pts_init is not None:
+        l_cd = chamfer_distance(adv_points, pts_init)
+        total = total + lambda_cd * l_cd
+        loss_dict['L_cd'] = l_cd.item()
+
+    if lambda_knn > 0:
+        l_knn = knn_smoothing_loss(adv_points, k=knn_k)
+        total = total + lambda_knn * l_knn
+        loss_dict['L_knn'] = l_knn.item()
+
+    if lambda_nproj > 0 and pts_init is not None and normals_init is not None:
+        l_nproj = normal_projection_loss(adv_points, pts_init, normals_init)
+        total = total + lambda_nproj * l_nproj
+        loss_dict['L_nproj'] = l_nproj.item()
+
+    loss_dict['L_total'] = total.item()
     return total, loss_dict
 
 
@@ -361,12 +395,17 @@ def pointopt_loss(point_cls_logits, rpn_box_preds, point_features,
 # Checkpoint I/O
 # ---------------------------------------------------------------------------
 
-def _save_checkpoint(adv_points, history, save_dir, tag='latest'):
-    path = os.path.join(save_dir, f'adv_points_pointopt_{tag}.pth')
-    torch.save({
+def _save_checkpoint(adv_points, history, save_dir, tag='latest',
+                     pts_init=None, method='pointopt'):
+    path = os.path.join(save_dir, f'whitebox_pointopt_{tag}.pth')
+    data = {
         'adv_points': adv_points.detach().cpu(),
         'history': history,
-    }, path)
+        'method': method,
+    }
+    if pts_init is not None:
+        data['pts_init'] = pts_init.detach().cpu()
+    torch.save(data, path)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +414,9 @@ def _save_checkpoint(adv_points, history, save_dir, tag='latest'):
 
 def _process_frames_on_gpu(wrapper, dataset, frame_indices, injection_cache,
                            adv_points_main, gpu_device, ref_feature,
-                           lw, lambda_uni, target_car_size, total_batch_size):
+                           lw, lambda_uni, target_car_size, total_batch_size,
+                           pts_init=None, normals_init=None,
+                           phys_cfg=None):
     """Run forward + backward for a subset of frames on one GPU.
 
     Returns (grad, loss_dicts, n_valid).  ``grad`` is on ``gpu_device``.
@@ -384,6 +425,15 @@ def _process_frames_on_gpu(wrapper, dataset, frame_indices, injection_cache,
 
     adv_local = adv_points_main.detach().to(gpu_device).requires_grad_(True)
     ref_local = ref_feature.to(gpu_device)
+    pts_init_local = pts_init.to(gpu_device) if pts_init is not None else None
+    normals_local = normals_init.to(gpu_device) if normals_init is not None else None
+
+    pc = phys_cfg or {}
+    lambda_cd = pc.get('lambda_cd', 0.0)
+    lambda_knn = pc.get('lambda_knn', 0.0)
+    lambda_nproj = pc.get('lambda_nproj', 0.0)
+    knn_k = pc.get('knn_k', 10)
+    noise_sigma = pc.get('noise_sigma', 0.0)
 
     loss_dicts = []
     n_valid = 0
@@ -393,6 +443,7 @@ def _process_frames_on_gpu(wrapper, dataset, frame_indices, injection_cache,
             wrapper, dataset, fi, injection_cache,
             adv_local, gpu_device,
             rpn_only=True, run_post=False,
+            noise_sigma=noise_sigma,
         )
         if frame is None:
             continue
@@ -412,6 +463,12 @@ def _process_frames_on_gpu(wrapper, dataset, frame_indices, injection_cache,
             beta_size=lw['beta_size'],
             lambda_uni=lambda_uni,
             target_size=target_car_size,
+            pts_init=pts_init_local,
+            normals_init=normals_local,
+            lambda_cd=lambda_cd,
+            lambda_knn=lambda_knn,
+            lambda_nproj=lambda_nproj,
+            knn_k=knn_k,
         )
         (loss / total_batch_size).backward()
         loss_dicts.append(ld)
@@ -472,6 +529,15 @@ def run_pointopt_attack(dataset, config, save_dir='results',
     lw = atk['loss_weights']
     lambda_uni = po_cfg.get('lambda_uni', 0.001)
 
+    # Physical constraints config
+    phys_cfg = po_cfg.get('physical', {})
+    phys_enabled = phys_cfg.get('enabled', False)
+    lambda_cd = phys_cfg.get('lambda_cd', 0.0) if phys_enabled else 0.0
+    lambda_knn = phys_cfg.get('lambda_knn', 0.0) if phys_enabled else 0.0
+    lambda_nproj = phys_cfg.get('lambda_nproj', 0.0) if phys_enabled else 0.0
+    knn_k = phys_cfg.get('knn_k', 10)
+    noise_sigma = phys_cfg.get('noise_sigma', 0.0) if phys_enabled else 0.0
+
     # Half-extents for bounding box projection
     half_ext = torch.tensor(
         [s / 2.0 for s in target_car_size], dtype=torch.float32, device=device
@@ -494,6 +560,14 @@ def run_pointopt_attack(dataset, config, save_dir='results',
                 n_points, size=target_car_size, device=device
             )
         adv_points = adv_points.requires_grad_(True)
+
+    # Store initial points for physical constraints (Chamfer + normal proj)
+    pts_init = adv_points.detach().clone()
+    normals_init = None
+    if phys_enabled:
+        normals_init = estimate_normals_knn(pts_init, k=knn_k)
+        print(f"  Physical constraints: CD={lambda_cd}, kNN={lambda_knn}, "
+              f"NProj={lambda_nproj}, k={knn_k}, noise_σ={noise_sigma}")
 
     print(f"  adv_points shape: {adv_points.shape}")
 
@@ -567,13 +641,20 @@ def run_pointopt_attack(dataset, config, save_dir='results',
         'L_feat': [], 'L_uni': [],
         'n_proposals_near': [], 'rcnn_best_conf': [],
     }
+    if phys_enabled:
+        for k in ('L_cd', 'L_knn', 'L_nproj'):
+            history[k] = []
 
     # ── Main loop ──
     print(f"\n{'='*70}")
     print(f"  Direct Point Optimisation ({n_iters} iters, lr={lr}, "
           f"{n_points} points, {n_gpus} GPU(s))")
-    print(f"  Loss = L_cls + {lw['beta_loc']}*L_loc + {lw['beta_size']}*L_size"
-          f" + {lw['alpha_feat']}*L_feat + {lambda_uni}*L_uni")
+    loss_str = (f"  Loss = L_cls + {lw['beta_loc']}*L_loc + {lw['beta_size']}*L_size"
+                f" + {lw['alpha_feat']}*L_feat + {lambda_uni}*L_uni")
+    if phys_enabled:
+        loss_str += (f"\n         + {lambda_cd}*L_cd + {lambda_knn}*L_knn"
+                     f" + {lambda_nproj}*L_nproj")
+    print(loss_str)
     print(f"{'='*70}")
 
     effective_batch = min(batch_size, len(train_indices))
@@ -599,6 +680,11 @@ def run_pointopt_attack(dataset, config, save_dir='results',
                 chunks[i % n_gpus].append(fi)
 
             dev_list = list(devices)
+            phys_kw = {
+                'lambda_cd': lambda_cd, 'lambda_knn': lambda_knn,
+                'lambda_nproj': lambda_nproj, 'knn_k': knn_k,
+                'noise_sigma': noise_sigma,
+            } if phys_enabled else None
             with ThreadPoolExecutor(max_workers=n_gpus) as pool:
                 futures = []
                 for gi, dev in enumerate(dev_list):
@@ -609,6 +695,7 @@ def run_pointopt_attack(dataset, config, save_dir='results',
                         gpu_wrappers[dev], dataset, chunks[gi],
                         injection_cache, adv_points, dev, ref_feature,
                         lw, lambda_uni, target_car_size, total_batch,
+                        pts_init, normals_init, phys_kw,
                     ))
 
                 for fut in futures:
@@ -630,6 +717,7 @@ def run_pointopt_attack(dataset, config, save_dir='results',
                     wrapper, dataset, fi, injection_cache,
                     adv_points, device,
                     rpn_only=True, run_post=False,
+                    noise_sigma=noise_sigma,
                 )
                 if frame is None:
                     continue
@@ -649,6 +737,12 @@ def run_pointopt_attack(dataset, config, save_dir='results',
                     beta_size=lw['beta_size'],
                     lambda_uni=lambda_uni,
                     target_size=target_car_size,
+                    pts_init=pts_init,
+                    normals_init=normals_init,
+                    lambda_cd=lambda_cd,
+                    lambda_knn=lambda_knn,
+                    lambda_nproj=lambda_nproj,
+                    knn_k=knn_k,
                 )
 
                 (loss / total_batch).backward()
@@ -708,9 +802,15 @@ def run_pointopt_attack(dataset, config, save_dir='results',
                   f"rcnn_conf={avg_conf:.3f}")
 
         if (step + 1) % 200 == 0:
-            _save_checkpoint(adv_points, history, save_dir, tag='latest')
+            method_tag = 'pointopt_physical' if phys_enabled else 'pointopt'
+            _save_checkpoint(adv_points, history, save_dir, tag='latest',
+                             pts_init=pts_init if phys_enabled else None,
+                             method=method_tag)
 
-    _save_checkpoint(adv_points, history, save_dir, tag='final')
+    method_tag = 'pointopt_physical' if phys_enabled else 'pointopt'
+    _save_checkpoint(adv_points, history, save_dir, tag='final',
+                     pts_init=pts_init if phys_enabled else None,
+                     method=method_tag)
 
     for w in gpu_wrappers.values():
         w.remove_hook()

@@ -184,23 +184,37 @@ def visualize_3d_closeup(sample, adv_pts_local, inj_pos, cfg,
 
     # Run detection if wrapper provided
     det_boxes, det_scores = None, None
+    attack_success = False
+    best_det_conf = 0.0
+    proximity = cfg.get('eval', {}).get('proximity_thresh', 1.5)
     if wrapper is not None and device is not None:
         merged_pc, _ = inject_points(pc_np, adv_pts_local, inj_pos,
                                      remove_overlap=True)
         score_thresh = cfg.get('model', {}).get('score_thresh', 0.3)
         pc_t = torch.tensor(merged_pc.astype(np.float32), device=device)
         det_boxes, det_scores = wrapper.detect(pc_t, score_thresh=score_thresh)
+        if len(det_boxes) > 0:
+            dists = np.sqrt((det_boxes[:, 0] - inj_pos[0]) ** 2 +
+                            (det_boxes[:, 1] - inj_pos[1]) ** 2)
+            near = dists < proximity
+            if near.any():
+                attack_success = True
+                best_det_conf = float(det_scores[near].max())
 
     # View angle
     azim = np.degrees(np.arctan2(inj_pos[1], inj_pos[0])) - 90
     elev = 25
     pad = 4.0
 
+    status = '✓ SUCCESS' if attack_success else '✗ FAIL'
+    conf_str = f'  conf={best_det_conf:.2f}' if attack_success else ''
+
     fig = plt.figure(figsize=(22, 7))
     fig.suptitle(
-        f'Sample {sample["sample_id"]} — Point-Opt Adversarial Attack  '
+        f'Sample {sample["sample_id"]} — [{status}]{conf_str}  '
         f'({n_adv} adv pts, inject @ [{inj_pos[0]:.1f}, {inj_pos[1]:.1f}, {inj_pos[2]:.1f}])',
-        fontsize=13, fontweight='bold'
+        fontsize=13, fontweight='bold',
+        color='#00e676' if attack_success else '#ff5252',
     )
 
     panels = [
@@ -248,17 +262,21 @@ def visualize_3d_closeup(sample, adv_pts_local, inj_pos, cfg,
             draw_bbox_3d(ax, phantom_bbox, color='red', lw=1.0,
                          label='Phantom bbox')
 
-        # Detection boxes
+        # Detection boxes — yellow thick lines for near-injection, gray for others
         if show_mesh and det_boxes is not None and len(det_boxes) > 0:
-            near_dets = []
             for di, db in enumerate(det_boxes):
                 d = np.sqrt((db[0] - inj_pos[0]) ** 2 +
                             (db[1] - inj_pos[1]) ** 2)
-                if d < radius * 1.5:
-                    near_dets.append((db, det_scores[di]))
-            for di, (db, sc) in enumerate(near_dets):
-                draw_bbox_3d(ax, db, color='orange', lw=1.8,
-                             label=f'Det (conf≥{sc:.2f})' if di == 0 else None)
+                sc = det_scores[di]
+                if d < proximity:
+                    draw_bbox_3d(ax, db, color='#FFD600', lw=3.0,
+                                 label=f'☆ Phantom det (conf={sc:.2f})' if di == 0 or True else None)
+                    ax.text(db[0], db[1], db[2] + 1.0,
+                            f'{sc:.2f}', color='#FFD600', fontsize=9,
+                            fontweight='bold', ha='center', zorder=20)
+                elif d < radius * 1.5:
+                    draw_bbox_3d(ax, db, color='gray', lw=1.0,
+                                 label=f'Other det' if di == 0 else None)
 
         ax.view_init(elev=elev, azim=azim)
         ax.set_xlim(inj_pos[0] - pad, inj_pos[0] + pad)
@@ -273,7 +291,7 @@ def visualize_3d_closeup(sample, adv_pts_local, inj_pos, cfg,
     plt.tight_layout()
     plt.savefig(save_path, dpi=180, bbox_inches='tight')
     plt.close()
-    return True
+    return attack_success
 
 
 # ── BEV scene comparison ──────────────────────────────────────────────────
@@ -298,22 +316,37 @@ def visualize_bev_scene(sample, adv_pts_local, inj_pos,
     pc_adv_t = torch.tensor(merged_pc.astype(np.float32), device=device)
     pred_a, scores_a = wrapper.detect(pc_adv_t, score_thresh=st)
 
+    proximity = cfg.get('eval', {}).get('proximity_thresh', 1.5)
+    attack_success = False
+    best_conf = 0.0
+    if len(pred_a) > 0:
+        dists = np.sqrt((pred_a[:, 0] - inj_pos[0]) ** 2 +
+                        (pred_a[:, 1] - inj_pos[1]) ** 2)
+        near = dists < proximity
+        if near.any():
+            attack_success = True
+            best_conf = float(scores_a[near].max())
+
     cx, cy = inj_pos[0], inj_pos[1]
     r = 25
+    status = '✓ SUCCESS' if attack_success else '✗ FAIL'
+    conf_str = f'  best_conf={best_conf:.2f}' if attack_success else ''
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 8))
     fig.suptitle(
-        f'Sample {sample["sample_id"]}  |  GT: {len(gt_bboxes)} cars  |  '
+        f'Sample {sample["sample_id"]}  |  [{status}]{conf_str}  |  '
+        f'GT: {len(gt_bboxes)} cars  |  '
         f'Clean dets: {len(pred_c)}  →  Adv dets: {len(pred_a)}  |  '
         f'Adv pts: {n_adv}',
-        fontsize=13, fontweight='bold'
+        fontsize=13, fontweight='bold',
+        color='#00e676' if attack_success else '#ff5252',
     )
 
-    for col, (ax, title, preds, extra) in enumerate([
-        (axes[0], 'Clean Point Cloud', pred_c, None),
-        (axes[1], 'Adversarial Point Cloud', pred_a, adv_world),
+    for col, (ax, title, preds, scores_arr, extra) in enumerate([
+        (axes[0], 'Clean Point Cloud', pred_c, scores_c, None),
+        (axes[1], 'Adversarial Point Cloud', pred_a, scores_a, adv_world),
     ]):
-        ax.set_title(title, fontsize=12)
+        ax.set_title(title, fontsize=12, color='white')
         ax.set_facecolor('#1a1a2e')
 
         mask = ((np.abs(pc_np[:, 0] - cx) < r) &
@@ -334,10 +367,26 @@ def visualize_bev_scene(sample, adv_pts_local, inj_pos,
             ax.add_patch(poly)
 
         for i, bb in enumerate(preds):
+            d = np.sqrt((bb[0] - inj_pos[0]) ** 2 +
+                        (bb[1] - inj_pos[1]) ** 2)
+            sc = scores_arr[i] if i < len(scores_arr) else 0
             corners = bbox_corners_3d(bb)[:4, :2]
-            poly = plt.Polygon(corners, fill=False, edgecolor='orange',
-                               lw=1.5, label='Detection' if i == 0 else None)
-            ax.add_patch(poly)
+            if d < proximity:
+                poly = plt.Polygon(corners, fill=False, edgecolor='#FFD600',
+                                   lw=3, linestyle='-',
+                                   label=f'☆ Phantom det (conf={sc:.2f})')
+                ax.add_patch(poly)
+                cx_b, cy_b = bb[0], bb[1]
+                ax.text(cx_b, cy_b, f'{sc:.2f}', color='#FFD600',
+                        fontsize=11, fontweight='bold', ha='center',
+                        va='center', zorder=20,
+                        bbox=dict(boxstyle='round,pad=0.2',
+                                  facecolor='black', alpha=0.7))
+            else:
+                poly = plt.Polygon(corners, fill=False, edgecolor='orange',
+                                   lw=1.5,
+                                   label='Other det' if i == 0 else None)
+                ax.add_patch(poly)
 
         ax.scatter([inj_pos[0]], [inj_pos[1]], s=60, c='yellow',
                    edgecolors='black', marker='*', zorder=10,
@@ -363,7 +412,7 @@ def visualize_bev_scene(sample, adv_pts_local, inj_pos,
 def main():
     p = argparse.ArgumentParser(
         description='Visualize point-opt adversarial attack (3D + BEV)')
-    p.add_argument('--ckpt', default='results/adv_points_pointopt_final.pth',
+    p.add_argument('--ckpt', default='results/whitebox_pointopt_final.pth',
                    help='Point-opt checkpoint')
     p.add_argument('--config', default='configs/attack_config.yaml')
     p.add_argument('--gpu', type=int, default=0)
@@ -376,7 +425,12 @@ def main():
                    help='Mesh reconstruction method')
     p.add_argument('--bev', action='store_true',
                    help='Also generate BEV scene comparison')
+    p.add_argument('--success-only', action='store_true',
+                   help='Only visualize samples where attack succeeded')
     args = p.parse_args()
+
+    if args.success_only:
+        args.detect = True
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -412,7 +466,11 @@ def main():
     injection_cache, valid_indices = precompute_injections(val_ds, inj_cfg)
     print(f"  {len(valid_indices)}/{len(val_ds)} valid positions")
 
+    proximity = cfg.get('eval', {}).get('proximity_thresh', 1.5)
+    score_thresh = cfg['model']['score_thresh']
+
     count = 0
+    skipped = 0
     for idx in valid_indices:
         if count >= args.n_samples:
             break
@@ -420,13 +478,26 @@ def main():
         sample = val_ds[idx]
         inj_pos = injection_cache[idx]['pos']
 
+        if args.success_only and wrapper is not None:
+            merged_pc, _ = inject_points(
+                sample['pointcloud'], adv_pts, inj_pos, remove_overlap=True)
+            pc_t = torch.tensor(merged_pc.astype(np.float32), device=device)
+            det_b, det_s = wrapper.detect(pc_t, score_thresh=score_thresh)
+            has_phantom = False
+            if len(det_b) > 0:
+                dists = np.sqrt((det_b[:, 0] - inj_pos[0]) ** 2 +
+                                (det_b[:, 1] - inj_pos[1]) ** 2)
+                has_phantom = bool((dists < proximity).any())
+            if not has_phantom:
+                skipped += 1
+                continue
+
         sid = sample['sample_id']
         print(f'\n[{count + 1}/{args.n_samples}] Sample {sid}: '
               f'{len(sample["gt_bboxes"])} cars, '
               f'{len(sample["pointcloud"])} pts, '
               f'inject @ [{inj_pos[0]:.1f}, {inj_pos[1]:.1f}, {inj_pos[2]:.1f}]')
 
-        # 3D close-up
         p1 = os.path.join(args.out_dir, f'attack_3d_{sid}.png')
         visualize_3d_closeup(
             sample, adv_pts, inj_pos, cfg,
@@ -435,7 +506,6 @@ def main():
         )
         print(f'  → {p1}')
 
-        # BEV scene
         if args.bev and wrapper is not None:
             p2 = os.path.join(args.out_dir, f'attack_scene_{sid}.png')
             visualize_bev_scene(sample, adv_pts, inj_pos,
@@ -444,7 +514,11 @@ def main():
 
         count += 1
 
-    print(f'\nDone. {count} samples → {args.out_dir}/')
+    if args.success_only:
+        print(f'\nDone. {count} success samples visualized '
+              f'(skipped {skipped} failed). → {args.out_dir}/')
+    else:
+        print(f'\nDone. {count} samples → {args.out_dir}/')
 
 
 if __name__ == '__main__':

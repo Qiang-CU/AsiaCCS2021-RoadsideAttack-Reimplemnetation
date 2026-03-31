@@ -349,7 +349,7 @@ def _save_bb_checkpoint(vec, n_points, history, save_dir, tag='latest'):
     adv_points = torch.tensor(vec.reshape(n_points, 3),
                               dtype=torch.float32)
     os.makedirs(save_dir, exist_ok=True)
-    path = os.path.join(save_dir, f'adv_points_blackbox_{tag}.pth')
+    path = os.path.join(save_dir, f'blackbox_pointopt_{tag}.pth')
     torch.save({
         'adv_points': adv_points,
         'history': history,
