@@ -10,7 +10,8 @@
 ```
 lidar_attack_asiaccs/
 ├── configs/
-│   └── attack_config.yaml
+│   ├── attack_config.yaml          # 默认 mesh_offset 主线
+│   └── experiments/                # 对照实验配置
 ├── data/
 │   └── kitti -> ../../lidar_attack/data/kitti   # symlink to existing KITTI
 ├── models/
@@ -18,10 +19,10 @@ lidar_attack_asiaccs/
 ├── attack/
 │   ├── mesh.py                  # REUSE from lidar_attack/attack/mesh.py
 │   ├── renderer.py              # REUSE (adjust ray sampling origin)
-│   ├── reparameterize.py        # REUSE (update size constraints)
+│   ├── reparameterize.py        # KEEP for old mesh baseline only
 │   ├── inject.py                # NEW: BEV occupancy + blank region sampler
 │   ├── loss.py                  # NEW: L_cls + L_feat + L_box + L_area
-│   ├── whitebox.py              # NEW: appearing attack loop
+│   ├── whitebox.py              # NEW: appearing attack loop (mesh_offset + baseline)
 │   └── blackbox.py              # REUSE CMA-ES (new fitness function)
 ├── evaluation/
 │   ├── metrics.py               # REUSE (update ASR definition)
@@ -33,6 +34,13 @@ lidar_attack_asiaccs/
 ├── run_attack.py
 └── results/
 ```
+
+**Current code status**:
+- `whitebox.py` 现在支持两种 mesh 参数化：
+  - `mesh_offset`: `vertices = v0 + offset + t`
+  - `reparameterize`: 旧复现 baseline
+- 渲染器命中的对抗点云可通过 `attack.mesh.save_hit_points` 保存，便于做 mesh -> LiDAR 点云注入分析
+- 四组对照实验配置位于 `configs/experiments/`
 
 **Setup**: Create symlink for KITTI data to avoid duplication:
 ```bash
@@ -535,7 +543,7 @@ Expected result: ~98% accuracy at separating real vehicles from adversarial obje
 |-----------|--------|--------|
 | `attack/mesh.py` | **Reuse as-is** | `lidar_attack/attack/mesh.py` |
 | `attack/renderer.py` | **Reuse, minor edit** | Update ray sampling origin from rooftop to ground-level injection pos |
-| `attack/reparameterize.py` | **Reuse, update params** | Change `b` to `(0.45, 0.45, 0.41)`, `c` to `(0.1, 0.1, 0.0)` |
+| `attack/reparameterize.py` | **Keep for baseline only** | Current mainline can bypass it with `mesh_offset` |
 | `attack/blackbox.py` (CMA-ES) | **Reuse, new fitness fn** | Replace `hiding_fitness` with `appearing_fitness` |
 | `utils/kitti_utils.py` | **Reuse as-is** | `lidar_attack/utils/kitti_utils.py` |
 | `utils/bev_iou.py` | **Reuse as-is** | `lidar_attack/utils/bev_iou.py` |
@@ -545,7 +553,7 @@ Expected result: ~98% accuracy at separating real vehicles from adversarial obje
 | `models/pixor_net.py` | **Do NOT use** | Replaced by OpenPCDet PointRCNN |
 | `attack/rooftop.py` | **Do NOT use** | Replaced by `inject.py` |
 | `attack/loss.py` | **Rewrite from scratch** | Completely different loss structure |
-| `attack/whitebox.py` | **Rewrite from scratch** | Appearing attack, different loop structure |
+| `attack/whitebox.py` | **Rewrite from scratch** | Appearing attack; now supports both `mesh_offset` and baseline `reparameterize` |
 | `models/pointrcnn_wrapper.py` | **Build new** | OpenPCDet hook interface |
 | `attack/inject.py` | **Build new** | BEV occupancy + blank region sampler |
 | `precompute_features.py` | **Build new** | Reference car feature extraction |

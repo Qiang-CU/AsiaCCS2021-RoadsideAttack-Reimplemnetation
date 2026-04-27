@@ -25,10 +25,115 @@ from attack.inject import (
     build_bev_occupancy, sample_injection_position,
     inject_points, get_injection_metadata,
 )
-from attack.loss import (
-    appearing_loss, laplacian_loss, apply_physical_constraints,
-)
+from attack.loss import appearing_loss, apply_physical_constraints
 from model.pointrcnn_wrapper import PointRCNNWrapper
+
+
+def _infer_mesh_param_mode(atk=None, ckpt=None):
+    """Resolve mesh parameterisation mode from config or checkpoint."""
+    if ckpt is not None:
+        mode = ckpt.get('param_mode')
+        if mode:
+            return mode
+        if 'offset' in ckpt or 't' in ckpt:
+            return 'mesh_offset'
+        return 'reparameterize'
+
+    atk = atk or {}
+    mesh_cfg = atk.get('mesh', {})
+    return mesh_cfg.get('param_mode', atk.get('mesh_param_mode', 'mesh_offset'))
+
+
+def _build_mesh_vertices(v0, mesh_param, translation_param, param_mode, b, c,
+                         device):
+    """Map optimisable variables to local-frame mesh vertices."""
+    if param_mode == 'reparameterize':
+        return reparameterize(
+            v0, mesh_param, translation_param, torch.eye(3, device=device), b, c
+        )
+    if param_mode == 'mesh_offset':
+        return v0 + mesh_param + translation_param.unsqueeze(0)
+    raise ValueError(f'Unknown mesh param_mode: {param_mode}')
+
+
+def _apply_mesh_offset_constraints(offset, translation, v0, size_limit,
+                                   translation_limit):
+    """Explicitly clamp mesh size and local translation for offset+t mode."""
+    for d in range(3):
+        translation.data[d].clamp_(
+            -translation_limit[d].item(), translation_limit[d].item()
+        )
+
+    verts_shape = v0 + offset
+    centre = verts_shape.mean(dim=0, keepdim=True)
+    verts_shape = verts_shape - centre
+    for d in range(3):
+        verts_shape[:, d].data.clamp_(
+            -size_limit[d].item(), size_limit[d].item()
+        )
+    offset.data.copy_(verts_shape + centre - v0)
+
+
+def _maybe_save_hit_points(adv_pts, sample, injection_pos, save_cfg, save_dir,
+                           stage, step=None):
+    """Optionally persist LiDAR-hit adversarial points for debugging."""
+    if not save_cfg or not save_cfg.get('enabled', False):
+        return
+
+    when = save_cfg.get('when', ['apply'])
+    if isinstance(when, str):
+        when = [when]
+    if 'all' not in when and stage not in when:
+        return
+
+    out_dir = os.path.join(save_dir, save_cfg.get('subdir', 'debug_mesh_hits'))
+    os.makedirs(out_dir, exist_ok=True)
+
+    max_files = save_cfg.get('max_files')
+    if max_files is not None and max_files >= 0:
+        n_existing = len([n for n in os.listdir(out_dir) if n.endswith('.pth')])
+        if n_existing >= max_files:
+            return
+
+    name_parts = [stage, str(sample.get('sample_id', 'unknown'))]
+    if step is not None:
+        name_parts.append(f'step{int(step):04d}')
+    out_path = os.path.join(out_dir, '_'.join(name_parts) + '.pth')
+
+    payload = {
+        'adv_points': adv_pts.detach().cpu(),
+        'injection_pos': np.asarray(injection_pos, dtype=np.float32),
+        'sample_id': sample.get('sample_id'),
+        'stage': stage,
+    }
+    if step is not None:
+        payload['step'] = int(step)
+    torch.save(payload, out_path)
+
+
+def load_mesh_checkpoint(ckpt_path, map_location='cpu'):
+    """Load mesh checkpoint and normalize old/new parameterization fields."""
+    ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+    param_mode = _infer_mesh_param_mode(ckpt=ckpt)
+    if param_mode == 'mesh_offset':
+        mesh_param = ckpt['offset']
+        translation_param = ckpt['t']
+    else:
+        mesh_param = ckpt['delta_v']
+        translation_param = ckpt['t_tilde']
+
+    return {
+        'ckpt': ckpt,
+        'param_mode': param_mode,
+        'mesh_param': mesh_param,
+        'translation_param': translation_param,
+        'v0': ckpt['v0'],
+        'faces': ckpt['faces'],
+        'b': ckpt.get('b'),
+        'c': ckpt.get('c'),
+        'history': ckpt.get('history', {}),
+        'method': ckpt.get('method', 'single_stage_whitebox'),
+    }
 
 
 def count_proposals_near(rois, injection_pos, proximity=3.0):
@@ -94,11 +199,13 @@ def precompute_injections(dataset, inj_cfg, rng=None):
 
 
 def _run_one_frame(wrapper, dataset, frame_idx, injection_cache,
-                   v0, delta_v, t_tilde, faces, b, c,
+                   v0, mesh_param, translation_param, faces, b, c,
                    lidar_cfg, sensor_pos, device,
-                   rpn_only=False, run_post=True):
+                   rpn_only=False, run_post=True,
+                   param_mode='mesh_offset', hit_save_cfg=None,
+                   save_dir='results', save_stage='train', save_step=None):
     """
-    Forward pass for one frame: reparameterize -> render -> inject -> PointRCNN.
+    Forward pass for one frame: mesh params -> render -> inject -> PointRCNN.
 
     Args:
         rpn_only:  skip RCNN head (faster for training)
@@ -109,8 +216,9 @@ def _run_one_frame(wrapper, dataset, frame_idx, injection_cache,
     sample = dataset[int(frame_idx)]
     inj_pos = injection_cache[int(frame_idx)]['pos']
 
-    vertices = reparameterize(v0, delta_v, t_tilde,
-                              torch.eye(3, device=device), b, c)
+    vertices = _build_mesh_vertices(
+        v0, mesh_param, translation_param, param_mode, b, c, device
+    )
     inj_t = torch.tensor(inj_pos, dtype=torch.float32, device=device)
     vertices_world = vertices + inj_t.unsqueeze(0)
 
@@ -124,6 +232,11 @@ def _run_one_frame(wrapper, dataset, frame_idx, injection_cache,
     )
     if adv_pts.shape[0] == 0:
         return None
+
+    _maybe_save_hit_points(
+        adv_pts, sample, inj_pos, hit_save_cfg, save_dir, save_stage,
+        step=save_step,
+    )
 
     pc_tensor = torch.tensor(
         sample['pointcloud'], dtype=torch.float32, device=device
@@ -161,7 +274,7 @@ def run_whitebox_attack(dataset, config, save_dir='results',
         warm_start_ckpt:  path to checkpoint for warm-start
 
     Returns:
-        delta_v, t_tilde, history
+        mesh_param, translation_param, history
     """
     os.makedirs(save_dir, exist_ok=True)
     atk = config['attack']
@@ -176,6 +289,9 @@ def run_whitebox_attack(dataset, config, save_dir='results',
     grad_scale = atk.get('grad_scale', 10.0)
     batch_size = atk.get('multi_frame_batch', 8)
     target_car_size = tuple(atk.get('phantom_box_size', [4.0, 1.6, 1.5]))
+    mesh_param_mode = _infer_mesh_param_mode(atk=atk)
+    mesh_cfg = atk.get('mesh', {})
+    hit_save_cfg = mesh_cfg.get('save_hit_points', atk.get('save_hit_points', {}))
 
     # ── Mesh setup ──
     v0, faces, adj = create_icosphere(subdivisions=atk['mesh_subdivisions'])
@@ -186,13 +302,20 @@ def run_whitebox_attack(dataset, config, save_dir='results',
 
     # ── Initialize parameters ──
     if warm_start_ckpt and os.path.exists(warm_start_ckpt):
-        ckpt = torch.load(warm_start_ckpt, map_location=device, weights_only=False)
-        delta_v = ckpt['delta_v'].to(device).requires_grad_(True)
-        t_tilde = ckpt['t_tilde'].to(device).requires_grad_(True)
+        loaded = load_mesh_checkpoint(warm_start_ckpt, map_location=device)
+        if loaded['param_mode'] != mesh_param_mode:
+            raise ValueError(
+                f"Warm-start checkpoint mode {loaded['param_mode']} does not "
+                f"match config mode {mesh_param_mode}"
+            )
+        mesh_param = loaded['mesh_param'].to(device).requires_grad_(True)
+        translation_param = (
+            loaded['translation_param'].to(device).requires_grad_(True)
+        )
         print(f"Warm-started from {warm_start_ckpt}")
     else:
-        delta_v = torch.zeros_like(v0, requires_grad=True)
-        t_tilde = torch.zeros(3, device=device, requires_grad=True)
+        mesh_param = torch.zeros_like(v0, requires_grad=True)
+        translation_param = torch.zeros(3, device=device, requires_grad=True)
 
     # ── Load reference car feature ──
     ref_path = config.get('ref_feature', {}).get('output_path',
@@ -239,7 +362,7 @@ def run_whitebox_attack(dataset, config, save_dir='results',
     )
 
     # ── Optimizer ──
-    optimizer = torch.optim.Adam([delta_v, t_tilde], lr=lr)
+    optimizer = torch.optim.Adam([mesh_param, translation_param], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=n_iters, eta_min=lr * 0.01)
 
@@ -252,6 +375,7 @@ def run_whitebox_attack(dataset, config, save_dir='results',
     # ── Main optimization loop ──
     print(f"\n{'='*70}")
     print(f"  Single-stage RPN optimization ({n_iters} iters, lr={lr})")
+    print(f"  Mesh param mode: {mesh_param_mode}")
     print(f"  Loss = L_cls + {lw['beta_loc']}*L_loc + {lw['beta_size']}*L_size"
           f" + {lw['alpha_feat']}*L_feat + {lw['lambda_lap']}*L_lap")
     print(f"{'='*70}")
@@ -274,9 +398,14 @@ def run_whitebox_attack(dataset, config, save_dir='results',
         for fi in batch_idx:
             frame = _run_one_frame(
                 wrapper, dataset, fi, injection_cache,
-                v0, delta_v, t_tilde, faces, b, c,
+                v0, mesh_param, translation_param, faces, b, c,
                 lidar_cfg, sensor_pos, device,
                 rpn_only=True, run_post=False,
+                param_mode=mesh_param_mode,
+                hit_save_cfg=hit_save_cfg,
+                save_dir=save_dir,
+                save_stage='train',
+                save_step=step + 1,
             )
             if frame is None:
                 continue
@@ -311,16 +440,21 @@ def run_whitebox_attack(dataset, config, save_dir='results',
 
             # Amplify gradients through the renderer → backbone chain
             if grad_scale != 1.0:
-                if delta_v.grad is not None:
-                    delta_v.grad.data.mul_(grad_scale)
-                if t_tilde.grad is not None:
-                    t_tilde.grad.data.mul_(grad_scale)
+                if mesh_param.grad is not None:
+                    mesh_param.grad.data.mul_(grad_scale)
+                if translation_param.grad is not None:
+                    translation_param.grad.data.mul_(grad_scale)
 
             optimizer.step()
             scheduler.step()
 
         with torch.no_grad():
-            apply_physical_constraints(delta_v, v0, tuple(b.tolist()))
+            if mesh_param_mode == 'reparameterize':
+                apply_physical_constraints(mesh_param, v0, tuple(b.tolist()))
+            else:
+                _apply_mesh_offset_constraints(
+                    mesh_param, translation_param, v0, b, c
+                )
 
         for k in history:
             history[k].append(step_loss.get(k, 0.0))
@@ -342,10 +476,15 @@ def run_whitebox_attack(dataset, config, save_dir='results',
                 for ci in check_idx:
                     cf = _run_one_frame(
                         wrapper, dataset, ci, injection_cache,
-                        v0, delta_v.detach(), t_tilde.detach(),
+                        v0, mesh_param.detach(), translation_param.detach(),
                         faces, b, c,
                         lidar_cfg, sensor_pos, device,
                         rpn_only=False, run_post=True,
+                        param_mode=mesh_param_mode,
+                        hit_save_cfg=hit_save_cfg,
+                        save_dir=save_dir,
+                        save_stage='monitor',
+                        save_step=step + 1,
                     )
                     if cf is None:
                         continue
@@ -363,19 +502,25 @@ def run_whitebox_attack(dataset, config, save_dir='results',
                   f"rcnn_conf={avg_conf:.3f}")
 
         if (step + 1) % 200 == 0:
-            _save_checkpoint(delta_v, t_tilde, v0, faces, history,
-                             save_dir, tag='latest')
+            _save_checkpoint(
+                mesh_param, translation_param, v0, faces, history,
+                save_dir, tag='latest', param_mode=mesh_param_mode, b=b, c=c,
+            )
 
-    _save_checkpoint(delta_v, t_tilde, v0, faces, history,
-                     save_dir, tag='final')
+    _save_checkpoint(
+        mesh_param, translation_param, v0, faces, history,
+        save_dir, tag='final', param_mode=mesh_param_mode, b=b, c=c,
+    )
 
     wrapper.remove_hook()
     print(f"\nAttack complete. Results saved to {save_dir}/")
-    return delta_v.detach(), t_tilde.detach(), history
+    return mesh_param.detach(), translation_param.detach(), history
 
 
-def apply_attack_to_sample(sample, delta_v, t_tilde, v0, faces,
-                           config, device, injection_pos=None):
+def apply_attack_to_sample(sample, mesh_param, translation_param, v0, faces,
+                           config, device, injection_pos=None,
+                           param_mode='reparameterize', save_dir='results',
+                           save_stage='apply'):
     """
     Apply the optimized adversarial mesh to a single sample for evaluation.
     """
@@ -384,12 +529,13 @@ def apply_attack_to_sample(sample, delta_v, t_tilde, v0, faces,
 
     b = torch.tensor(atk['size_limit'], dtype=torch.float32, device=device)
     c = torch.tensor(atk['translation_limit'], dtype=torch.float32, device=device)
-    R = torch.eye(3, device=device)
     sensor_pos = torch.zeros(3, device=device)
     lidar_cfg = atk.get('lidar', {})
+    mesh_cfg = atk.get('mesh', {})
+    hit_save_cfg = mesh_cfg.get('save_hit_points', atk.get('save_hit_points', {}))
 
-    delta_v_d = delta_v.to(device)
-    t_tilde_d = t_tilde.to(device)
+    delta_v_d = mesh_param.to(device)
+    t_tilde_d = translation_param.to(device)
     v0_d = v0.to(device)
     faces_d = faces.to(device)
 
@@ -408,7 +554,9 @@ def apply_attack_to_sample(sample, delta_v, t_tilde, v0, faces,
         )
 
     with torch.no_grad():
-        vertices = reparameterize(v0_d, delta_v_d, t_tilde_d, R, b, c)
+        vertices = _build_mesh_vertices(
+            v0_d, delta_v_d, t_tilde_d, param_mode, b, c, device
+        )
         inj_t = torch.tensor(injection_pos, dtype=torch.float32, device=device)
         vertices_world = vertices + inj_t.unsqueeze(0)
 
@@ -421,6 +569,12 @@ def apply_attack_to_sample(sample, delta_v, t_tilde, v0, faces,
             margin_deg=lidar_cfg.get('ray_margin_deg', 2.0),
         )
 
+    mesh_cfg = atk.get('mesh', {})
+    hit_save_cfg = mesh_cfg.get('save_hit_points', atk.get('save_hit_points', {}))
+    _maybe_save_hit_points(
+        adv_pts, sample, injection_pos, hit_save_cfg, save_dir, save_stage
+    )
+
     adv_pts_np = adv_pts.cpu().numpy()
     merged, n_adv = inject_points(
         sample['pointcloud'], adv_pts_np,
@@ -430,17 +584,26 @@ def apply_attack_to_sample(sample, delta_v, t_tilde, v0, faces,
     return merged, n_adv
 
 
-def _save_checkpoint(delta_v, t_tilde, v0, faces, history, save_dir,
-                     tag='latest'):
+def _save_checkpoint(mesh_param, translation_param, v0, faces, history, save_dir,
+                     tag='latest', param_mode='mesh_offset', b=None, c=None):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f'adv_mesh_whitebox_{tag}.pth')
     data = {
-        'delta_v': delta_v.detach().cpu(),
-        't_tilde': t_tilde.detach().cpu(),
         'v0': v0.detach().cpu(),
         'faces': faces.detach().cpu(),
         'history': history,
         'method': 'single_stage_whitebox',
+        'param_mode': param_mode,
     }
+    if param_mode == 'mesh_offset':
+        data['offset'] = mesh_param.detach().cpu()
+        data['t'] = translation_param.detach().cpu()
+    else:
+        data['delta_v'] = mesh_param.detach().cpu()
+        data['t_tilde'] = translation_param.detach().cpu()
+    if b is not None:
+        data['b'] = b.detach().cpu()
+    if c is not None:
+        data['c'] = c.detach().cpu()
     torch.save(data, path)
     return path

@@ -13,6 +13,9 @@ model:
   score_thresh: 0.3
   nms_thresh: 0.1
 
+output:
+  save_dir: results
+
 attack:
   mode: whitebox          # whitebox or blackbox
   n_iters: 1000
@@ -34,6 +37,14 @@ attack:
 
   multi_frame_batch: 8
   phantom_box_size: [3.9, 1.6, 1.56]  # typical KITTI car dimensions (for L_size target)
+
+  mesh:
+    param_mode: mesh_offset   # mesh_offset or reparameterize
+    save_hit_points:
+      enabled: false
+      when: [apply]
+      subdir: debug_mesh_hits
+      max_files: 32
 
   # Injection settings
   injection:

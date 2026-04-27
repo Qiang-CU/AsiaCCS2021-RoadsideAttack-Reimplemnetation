@@ -40,6 +40,10 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
+def get_save_dir(config):
+    return config.get('output', {}).get('save_dir', 'results')
+
+
 def get_wrapper(config, device, enable_ste=None):
     from model.pointrcnn_wrapper import PointRCNNWrapper
     if enable_ste is None:
@@ -157,13 +161,14 @@ def mode_whitebox(config, device, warm_start_ckpt=None):
     print("=" * 60)
 
     config['device'] = device
+    save_dir = get_save_dir(config)
 
     from attack.whitebox import run_whitebox_attack
 
     dataset = get_dataset(config)
 
-    delta_v, t_tilde, history = run_whitebox_attack(
-        dataset, config, save_dir='results',
+    mesh_param, translation_param, history = run_whitebox_attack(
+        dataset, config, save_dir=save_dir,
         warm_start_ckpt=warm_start_ckpt,
     )
 
@@ -173,7 +178,7 @@ def mode_whitebox(config, device, warm_start_ckpt=None):
         'L_cls': history['L_cls'],
         'L_loc': history['L_loc'],
     }
-    plot_loss_curve(loss_keys, save_path='results/whitebox_loss.png')
+    plot_loss_curve(loss_keys, save_path=os.path.join(save_dir, 'whitebox_loss.png'))
 
 
 def mode_pointopt(config, device, warm_start_ckpt=None, devices=None):
@@ -194,6 +199,7 @@ def mode_pointopt(config, device, warm_start_ckpt=None, devices=None):
     print("=" * 60)
 
     config['device'] = str(devices[0])
+    save_dir = get_save_dir(config)
 
     from attack.whitebox_pointopt import run_pointopt_attack
 
@@ -204,7 +210,7 @@ def mode_pointopt(config, device, warm_start_ckpt=None, devices=None):
         wrappers = build_multi_gpu_wrappers(config, devices)
 
     adv_points, history = run_pointopt_attack(
-        dataset, config, save_dir='results',
+        dataset, config, save_dir=save_dir,
         warm_start_ckpt=warm_start_ckpt,
         devices=devices, wrappers=wrappers,
     )
@@ -215,7 +221,9 @@ def mode_pointopt(config, device, warm_start_ckpt=None, devices=None):
         'L_cls': history['L_cls'],
         'L_loc': history['L_loc'],
     }
-    plot_loss_curve(loss_keys, save_path='results/whitebox_pointopt_loss.png')
+    plot_loss_curve(
+        loss_keys, save_path=os.path.join(save_dir, 'whitebox_pointopt_loss.png')
+    )
 
 
 def mode_eval_pointopt(config, devices, ckpt_path):
@@ -228,6 +236,7 @@ def mode_eval_pointopt(config, devices, ckpt_path):
 
     wrappers = build_multi_gpu_wrappers(config, devices)
     dataset = get_dataset(config)
+    save_dir = get_save_dir(config)
 
     asr, stats = compute_pointopt_asr(
         dataset=dataset, adv_points_ckpt=ckpt_path,
@@ -235,7 +244,7 @@ def mode_eval_pointopt(config, devices, ckpt_path):
         devices=devices, wrappers=wrappers,
     )
 
-    os.makedirs('results', exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
 
     adv_ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     adv_pts = adv_ckpt['adv_points'].numpy()
@@ -260,10 +269,11 @@ def mode_eval_pointopt(config, devices, ckpt_path):
         },
     }
 
-    with open('results/asr_pointopt_results.json', 'w') as f:
+    result_path = os.path.join(save_dir, 'asr_pointopt_results.json')
+    with open(result_path, 'w') as f:
         json.dump(result_summary, f, indent=2, ensure_ascii=False)
 
-    print(f"\n  Results saved to results/asr_pointopt_results.json")
+    print(f"\n  Results saved to {result_path}")
     print(f"  ASR: {stats['n_success']}/{stats['n_eligible']} = {asr*100:.1f}%")
     print(f"  Object size: {extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f} m")
     print(f"  Points: {len(adv_pts)}")
@@ -282,12 +292,13 @@ def mode_blackbox(config, device, devices=None):
 
     if devices is None:
         devices = [torch.device(device)]
+    save_dir = get_save_dir(config)
 
     wrapper = get_wrapper(config, str(devices[0]))
     dataset = get_dataset(config)
 
     adv_points, history = run_blackbox_appearing_attack(
-        dataset, wrapper, config, devices, save_dir='results'
+        dataset, wrapper, config, devices, save_dir=save_dir
     )
 
     pts_np = adv_points.numpy()
@@ -317,11 +328,12 @@ def mode_blackbox(config, device, devices=None):
         },
     }
 
-    os.makedirs('results', exist_ok=True)
-    with open('results/blackbox_summary.json', 'w') as f:
+    os.makedirs(save_dir, exist_ok=True)
+    summary_path = os.path.join(save_dir, 'blackbox_summary.json')
+    with open(summary_path, 'w') as f:
         json.dump(bb_summary, f, indent=2, ensure_ascii=False)
 
-    print(f"\n  Blackbox attack summary saved to results/blackbox_summary.json")
+    print(f"\n  Blackbox attack summary saved to {summary_path}")
     print(f"  Best fitness: {min(history['best_fitness']):.4f}")
     print(f"  Best ASR: {history['best_asr'][-1]:.1%}" if history['best_asr'] else "")
     print(f"  Object size: {extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f} m")
@@ -345,6 +357,7 @@ def mode_physical_verify(config, devices, ckpt_path, mesh_method='poisson',
     print(f"  Mesh method: {mesh_method}")
     print(f"  Sample method: {sample_method}")
     print("=" * 60)
+    save_dir = get_save_dir(config)
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     adv_pts = ckpt['adv_points'].numpy()
@@ -378,8 +391,8 @@ def mode_physical_verify(config, devices, ckpt_path, mesh_method='poisson',
           f" x {re_verts_extent[2]:.3f} m")
 
     # Export mesh for inspection
-    os.makedirs('results', exist_ok=True)
-    mesh_dir = 'results/mesh_export'
+    os.makedirs(save_dir, exist_ok=True)
+    mesh_dir = os.path.join(save_dir, 'mesh_export')
     os.makedirs(mesh_dir, exist_ok=True)
     obj_path = os.path.join(mesh_dir, 'physical_reconstructed.obj')
     export_obj(verts, faces, obj_path, f'{mesh_method} reconstructed')
@@ -428,7 +441,7 @@ def mode_physical_verify(config, devices, ckpt_path, mesh_method='poisson',
               f" x {re_extent[2]:.3f} m")
 
         ckpt_tag = f'adv_points_physical_{sm}.pth'
-        resampled_ckpt_path = f'results/{ckpt_tag}'
+        resampled_ckpt_path = os.path.join(save_dir, ckpt_tag)
         torch.save({
             'adv_points': torch.tensor(resampled_pts, dtype=torch.float32),
             'method': f'physical_verify_{sm}',
@@ -493,7 +506,8 @@ def mode_physical_verify(config, devices, ckpt_path, mesh_method='poisson',
         'sampling_results': results_by_method,
     }
 
-    with open('results/physical_verify_results.json', 'w') as f:
+    result_path = os.path.join(save_dir, 'physical_verify_results.json')
+    with open(result_path, 'w') as f:
         json.dump(result_summary, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'='*60}")
@@ -505,7 +519,7 @@ def mode_physical_verify(config, devices, ckpt_path, mesh_method='poisson',
     for sm, r in results_by_method.items():
         print(f"  {sm:8s} ASR: {r['n_success']}/{r['n_eligible']}"
               f" = {r['asr_pct']} (retention: {r['retention_pct']})")
-    print(f"  Results: results/physical_verify_results.json")
+    print(f"  Results: {result_path}")
     print(f"  Mesh:    {obj_path}")
 
 
@@ -519,6 +533,7 @@ def mode_eval(config, devices, ckpt_path):
 
     wrappers = build_multi_gpu_wrappers(config, devices)
     dataset = get_dataset(config)
+    save_dir = get_save_dir(config)
 
     asr, stats = compute_appearing_asr(
         model_wrapper=None, dataset=dataset, adv_mesh_ckpt=ckpt_path,
@@ -526,15 +541,16 @@ def mode_eval(config, devices, ckpt_path):
         devices=devices, wrappers=wrappers,
     )
 
-    os.makedirs('results', exist_ok=True)
-    with open('results/asr_results.json', 'w') as f:
+    os.makedirs(save_dir, exist_ok=True)
+    result_path = os.path.join(save_dir, 'asr_results.json')
+    with open(result_path, 'w') as f:
         json.dump({
             'asr': asr,
             'n_eligible': stats['n_eligible'],
             'n_success': stats['n_success'],
         }, f, indent=2)
 
-    print(f"\n  Results saved to results/asr_results.json")
+    print(f"\n  Results saved to {result_path}")
 
 
 def mode_recall_iou(config, devices, ckpt_path):
@@ -548,6 +564,7 @@ def mode_recall_iou(config, devices, ckpt_path):
 
     wrappers = build_multi_gpu_wrappers(config, devices)
     dataset = get_dataset(config)
+    save_dir = get_save_dir(config)
 
     iou_thresholds, recall = compute_recall_iou_curve(
         model_wrapper=None, dataset=dataset, adv_mesh_ckpt=ckpt_path,
@@ -557,11 +574,11 @@ def mode_recall_iou(config, devices, ckpt_path):
 
     plot_recall_iou(
         iou_thresholds, recall,
-        save_path='results/recall_iou_appearing.png',
+        save_path=os.path.join(save_dir, 'recall_iou_appearing.png'),
         title='Appearing Attack Recall-IoU'
     )
 
-    np.savez('results/recall_iou_data.npz',
+    np.savez(os.path.join(save_dir, 'recall_iou_data.npz'),
              iou_thresholds=iou_thresholds, recall=recall)
 
 
@@ -573,7 +590,7 @@ def mode_eval_defenses(config, devices, ckpt_path):
 
     from concurrent.futures import ThreadPoolExecutor
     from tqdm import tqdm
-    from attack.whitebox import apply_attack_to_sample
+    from attack.whitebox import apply_attack_to_sample, load_mesh_checkpoint
     from evaluation.metrics import (
         has_detection_near_pos, knn_outlier_removal,
         gaussian_noise_defense, density_defense_features,
@@ -583,12 +600,14 @@ def mode_eval_defenses(config, devices, ckpt_path):
     wrappers = build_multi_gpu_wrappers(config, devices)
     n_gpus = len(devices)
     dataset = get_dataset(config)
+    save_dir = get_save_dir(config)
 
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    delta_v = ckpt['delta_v']
-    t_tilde = ckpt['t_tilde']
-    v0 = ckpt['v0']
-    faces = ckpt['faces']
+    loaded = load_mesh_checkpoint(ckpt_path, map_location='cpu')
+    mesh_param = loaded['mesh_param']
+    translation_param = loaded['translation_param']
+    v0 = loaded['v0']
+    faces = loaded['faces']
+    param_mode = loaded['param_mode']
 
     atk = config['attack']
     inj_cfg = atk['injection']
@@ -630,8 +649,9 @@ def mode_eval_defenses(config, devices, ckpt_path):
             return None  # not eligible
 
         pc_adv, _ = apply_attack_to_sample(
-            sample, delta_v, t_tilde, v0, faces, config, str(dev),
+            sample, mesh_param, translation_param, v0, faces, config, str(dev),
             injection_pos=inj_pos,
+            param_mode=param_mode,
         )
 
         result = {
@@ -691,7 +711,9 @@ def mode_eval_defenses(config, devices, ckpt_path):
         asr = s / max(n, 1)
         print(f"  {name:20s}: ASR = {s}/{n} = {asr*100:.1f}%")
 
-    with open('results/defense_results.json', 'w') as f:
+    os.makedirs(save_dir, exist_ok=True)
+    result_path = os.path.join(save_dir, 'defense_results.json')
+    with open(result_path, 'w') as f:
         json.dump(defense_results, f, indent=2)
 
 

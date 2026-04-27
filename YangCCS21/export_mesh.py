@@ -28,37 +28,42 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from attack.mesh import create_icosphere
-from attack.reparameterize import reparameterize
+from attack.whitebox import load_mesh_checkpoint, _build_mesh_vertices
 
 
 def load_mesh_from_ckpt(ckpt_path, device='cpu'):
     """Load and reconstruct mesh vertices from checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    delta_v = ckpt['delta_v']
-    t_tilde = ckpt['t_tilde']
-    v0 = ckpt['v0']
-    faces = ckpt['faces']
+    loaded = load_mesh_checkpoint(ckpt_path, map_location=device)
+    ckpt = loaded['ckpt']
+    mesh_param = loaded['mesh_param']
+    translation_param = loaded['translation_param']
+    v0 = loaded['v0']
+    faces = loaded['faces']
+    param_mode = loaded['param_mode']
 
-    # Reconstruct deformed mesh using reparameterization
-    # Use identity rotation (no car-specific placement)
-    R = torch.eye(3, dtype=torch.float32)
-    # Load b/c from checkpoint if saved, otherwise use YangCCS21 defaults
-    b = ckpt.get('b', torch.tensor([0.45, 0.45, 0.41], dtype=torch.float32))
-    c = ckpt.get('c', torch.tensor([0.1, 0.1, 0.0], dtype=torch.float32))
+    b = loaded['b']
+    c = loaded['c']
+    if b is None:
+        b = torch.tensor([0.45, 0.45, 0.41], dtype=torch.float32)
+    if c is None:
+        c = torch.tensor([0.1, 0.1, 0.0], dtype=torch.float32)
     if not isinstance(b, torch.Tensor):
         b = torch.tensor(b, dtype=torch.float32)
     if not isinstance(c, torch.Tensor):
         c = torch.tensor(c, dtype=torch.float32)
 
     with torch.no_grad():
-        verts_deformed = reparameterize(v0, delta_v, t_tilde, R, b, c)
+        verts_deformed = _build_mesh_vertices(
+            v0, mesh_param, translation_param, param_mode, b, c, device
+        )
 
     return {
         'v0': v0.numpy(),
         'verts': verts_deformed.numpy(),
         'faces': faces.numpy(),
-        'delta_v': delta_v.numpy(),
-        't_tilde': t_tilde.numpy(),
+        'mesh_param': mesh_param.numpy(),
+        'translation_param': translation_param.numpy(),
+        'param_mode': param_mode,
         'method': ckpt.get('method', 'whitebox'),
     }
 
@@ -584,8 +589,9 @@ def export_html_viewer(mesh_data, path, title='Adversarial Mesh Viewer'):
 <div id="info">
   <h3>Adversarial Mesh ({method})</h3>
   <p>Vertices: {len(verts)} | Faces: {len(faces)}</p>
-  <p>delta_v norm: {np.linalg.norm(mesh_data['delta_v']):.3f}</p>
-  <p>t_tilde: [{', '.join(f'{x:.3f}' for x in mesh_data['t_tilde'])}]</p>
+  <p>Param mode: {mesh_data['param_mode']}</p>
+  <p>mesh_param norm: {np.linalg.norm(mesh_data['mesh_param']):.3f}</p>
+  <p>translation: [{', '.join(f'{x:.3f}' for x in mesh_data['translation_param'])}]</p>
   <div style="margin-top:8px">
     <span class="btn active" onclick="toggleMesh('deformed')">Deformed</span>
     <span class="btn" onclick="toggleMesh('original')">Original</span>
@@ -776,7 +782,8 @@ def main():
         name = os.path.splitext(os.path.basename(args.ckpt))[0]
         print(f'  Method: {mesh["method"]}')
         print(f'  Vertices: {len(mesh["verts"])}, Faces: {len(mesh["faces"])}')
-        print(f'  delta_v norm: {np.linalg.norm(mesh["delta_v"]):.3f}')
+        print(f'  Param mode: {mesh["param_mode"]}')
+        print(f'  mesh_param norm: {np.linalg.norm(mesh["mesh_param"]):.3f}')
 
         obj_path = os.path.join(args.out_dir, f'{name}_deformed.obj')
         export_obj(mesh['verts'], mesh['faces'], obj_path, f'{name} (deformed)')

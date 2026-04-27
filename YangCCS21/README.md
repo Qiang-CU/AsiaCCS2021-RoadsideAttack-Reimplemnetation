@@ -15,7 +15,8 @@
 ```
 YangCCS21/
 ├── configs/
-│   └── attack_config.yaml          # 全局攻击/模型/数据配置
+│   ├── attack_config.yaml          # 默认配置（当前 mesh 主线 = offset+t）
+│   └── experiments/               # 四组对照实验配置
 ├── data/
 │   └── kitti -> ../../data/kitti    # 软链接到已有 KITTI 数据集
 ├── model/
@@ -25,10 +26,10 @@ YangCCS21/
 ├── attack/
 │   ├── mesh.py                     # 二十面体网格创建（仅 mesh 白盒用）
 │   ├── renderer.py                 # 可微分 LiDAR 渲染器（仅 mesh 白盒用）
-│   ├── reparameterize.py           # 网格顶点重参数化（仅 mesh 白盒用）
+│   ├── reparameterize.py           # 旧 mesh baseline 的重参数化
 │   ├── inject.py                   # BEV 占用图 + 空白区域采样 + 点云注入
 │   ├── loss.py                     # L_cls + L_feat + L_loc + L_size + L_lap 损失函数
-│   ├── whitebox.py                 # 白盒 mesh 攻击（ASR 0.1%，已废弃）
+│   ├── whitebox.py                 # 白盒 mesh 攻击（支持 mesh_offset / reparameterize）
 │   ├── whitebox_pointopt.py        # 白盒 point-opt 直接点优化（推荐）
 │   ├── blackbox.py                 # 原始黑盒 CMA-ES（隐藏攻击，遗留）
 │   └── blackbox_appearing.py       # 黑盒 CMA-ES + PointOpt（直接点优化）
@@ -44,7 +45,7 @@ YangCCS21/
 ├── bench_blackbox.py               # 黑盒攻击速度基准测试
 ├── test_inference.py               # Phase 0 验证：模型推理
 ├── test_gradient.py                # Phase 1 验证：梯度链路
-└── results/                        # 输出目录（检查点、曲线、JSON）
+└── results/                        # 默认输出目录；实验配置会写到各自子目录
 ```
 
 ---
@@ -83,14 +84,61 @@ PointRCNN 的梯度链路在 **ROI Head (PointRCNNHead)** 处断裂，因为 ROI
 | | Mesh 白盒 (`whitebox.py`) | Point-Opt 白盒 (`whitebox_pointopt.py`) | Point-Opt 黑盒 (`blackbox_appearing.py`) |
 |--|--------------------------|-----------------------------------|--------------------------------------|
 | **优化算法** | Adam 梯度下降 | Adam 梯度下降 | CMA-ES 进化策略（无梯度） |
-| **优化变量** | 网格顶点偏移 δv + 平移 t | 点坐标 (N, 3) 直接优化 | 点坐标 (N, 3) 直接搜索 |
+| **优化变量** | 网格顶点偏移 + 显式平移（可切回旧 reparameterize baseline） | 点坐标 (N, 3) 直接优化 | 点坐标 (N, 3) 直接搜索 |
 | **渲染** | 可微分光线-三角形求交 → 点云 | 无渲染，直接注入 | 无渲染，直接注入 |
 | **正则项** | L_lap (Laplacian smoothing) | L_uni (点均匀性) | L2 正则 |
-| **梯度噪声** | 高（mesh 重参数化 + 光线求交） | 低（直接链路） | 无（不用梯度） |
+| **梯度噪声** | 中高（默认 offset+t；旧 baseline 额外包含重参数化噪声） | 低（直接链路） | 无（不用梯度） |
 | **是否需要模型内部访问** | 是（RPN 梯度） | 是（RPN 梯度） | 否（只看检测输出） |
 | **ASR** | 0.1% (4/3720) | **47.1%** (1752/3720) | 待测 |
 
-**结论**：Mesh 路径因渲染器梯度噪声导致 ASR 极低，已废弃。Point-Opt 白盒是推荐的白盒路径。黑盒也已改用 Point-Opt 参数化。
+**结论**：当前仓库保留两条 mesh 白盒参数化：默认 `mesh_offset`（不使用重参数化）和旧 `reparameterize` baseline。Point-Opt 仍然是效果最强、最稳定的白盒路径；黑盒也已改用 Point-Opt 参数化。
+
+---
+
+## Mesh 参数化与实验矩阵
+
+### Mesh 白盒两种参数化
+
+- 默认 `configs/attack_config.yaml` 使用 `attack.mesh.param_mode: mesh_offset`
+- 旧复现基线使用 `attack.mesh.param_mode: reparameterize`
+- 新的 `mesh_offset` 形式为：`vertices = v0 + offset + t`
+- 旧的 baseline 形式为：`delta_v, t_tilde -> reparameterize() -> vertices`
+
+### LiDAR 命中点保存
+
+`whitebox.py` 现在支持保存渲染器命中的对抗点云 `adv_pts`。配置位于：
+
+```yaml
+attack:
+  mesh:
+    save_hit_points:
+      enabled: false
+      when: [apply]   # apply / train / monitor / all
+      subdir: debug_mesh_hits
+      max_files: 32
+```
+
+保存的是 **LiDAR 真正打到 mesh 后得到的对抗点云**，不是整帧注入后的场景点云。
+
+### 四组对照实验
+
+建议直接使用下面四份配置：
+
+```bash
+configs/experiments/mesh_reparam_baseline.yaml
+configs/experiments/pointopt_basic.yaml
+configs/experiments/pointopt_physical.yaml
+configs/experiments/pointopt_engineering.yaml
+```
+
+每份配置都带独立 `output.save_dir`，结果分别写到：
+
+```bash
+results/mesh_reparam_baseline/
+results/pointopt_basic/
+results/pointopt_physical/
+results/pointopt_engineering/
+```
 
 ---
 
@@ -117,6 +165,34 @@ python run_attack.py --mode precompute --device cuda:0
 ```
 
 输出 `results/ref_car_feature.pt`，后续所有攻击都依赖此文件。
+
+### Step 1.5 — 运行对照实验配置
+
+下面四条命令覆盖当前实验矩阵：
+
+```bash
+# 旧 mesh + reparameterize baseline
+python run_attack.py --mode whitebox \
+    --config configs/experiments/mesh_reparam_baseline.yaml --device cuda:0
+
+# pointopt-basic
+python run_attack.py --mode pointopt \
+    --config configs/experiments/pointopt_basic.yaml --gpu 0,1,2,3
+
+# pointopt+physical
+python run_attack.py --mode pointopt \
+    --config configs/experiments/pointopt_physical.yaml --gpu 0,1,2,3
+
+# pointopt+engineering
+python run_attack.py --mode pointopt \
+    --config configs/experiments/pointopt_engineering.yaml --gpu 0,1,2,3
+```
+
+如果你要跑默认的 **mesh 无重参数化主线**，直接使用：
+
+```bash
+python run_attack.py --mode whitebox --config configs/attack_config.yaml --device cuda:0
+```
 
 ### Step 2 — 白盒 Point-Opt 优化（数字域 ASR 最大化）
 
@@ -355,7 +431,7 @@ results/vis_physical_closest/attack_{3d,scene}_*.png  # closest 采样后
 3. **数据**：KITTI 数据通过软链接引用，确保 `data/kitti/training/` 下有 `velodyne/`、`label_2/`、`calib/` 和 `ImageSets/` 目录。
 4. **OpenPCDet 补丁**：已修改 `OpenPCDet/pcdet/datasets/__init__.py` 使非 KITTI 数据集导入变为可选，避免缺少 `av2` 等库时报错。
 5. **遗留文件**：`attack/blackbox.py` 是原始隐藏攻击的代码，**不属于本 appearing attack 流水线**。黑盒攻击请使用 `attack/blackbox_appearing.py`。
-6. **Mesh 白盒已废弃**：`whitebox.py` 和 `two_stage_attack.py` ASR 仅 0.1%，保留代码仅供参考。
+6. **Mesh 白盒现支持双模式**：`configs/attack_config.yaml` 默认是 `mesh_offset`，`configs/experiments/mesh_reparam_baseline.yaml` 可回到旧 `reparameterize` baseline。
 7. **Warm-start**：Point-Opt 支持 `--ckpt` 加载已有 checkpoint 继续训练。运行新 round 前建议备份旧 checkpoint。
 
 ### 初始化方案

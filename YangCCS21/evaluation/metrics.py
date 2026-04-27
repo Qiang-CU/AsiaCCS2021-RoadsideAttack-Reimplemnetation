@@ -87,7 +87,7 @@ def compute_appearing_asr(model_wrapper, dataset, adv_mesh_ckpt, config,
         asr:   float in [0, 1]
         stats: dict with detailed results
     """
-    from attack.whitebox import apply_attack_to_sample
+    from attack.whitebox import apply_attack_to_sample, load_mesh_checkpoint
 
     if devices is None:
         devices = [torch.device(device)]
@@ -95,11 +95,12 @@ def compute_appearing_asr(model_wrapper, dataset, adv_mesh_ckpt, config,
         wrappers = {devices[0]: model_wrapper}
     n_gpus = len(devices)
 
-    ckpt = torch.load(adv_mesh_ckpt, map_location='cpu', weights_only=False)
-    delta_v = ckpt['delta_v']
-    t_tilde = ckpt['t_tilde']
-    v0      = ckpt['v0']
-    faces   = ckpt['faces']
+    loaded = load_mesh_checkpoint(adv_mesh_ckpt, map_location='cpu')
+    mesh_param = loaded['mesh_param']
+    translation_param = loaded['translation_param']
+    v0 = loaded['v0']
+    faces = loaded['faces']
+    param_mode = loaded['param_mode']
 
     atk = config['attack']
     inj_cfg = atk['injection']
@@ -149,8 +150,9 @@ def compute_appearing_asr(model_wrapper, dataset, adv_mesh_ckpt, config,
             }
 
         pc_adv, n_adv = apply_attack_to_sample(
-            sample, delta_v, t_tilde, v0, faces, config, str(dev),
+            sample, mesh_param, translation_param, v0, faces, config, str(dev),
             injection_pos=inj_pos,
+            param_mode=param_mode,
         )
         pc_adv_t = torch.from_numpy(pc_adv.astype(np.float32)).to(dev)
         with torch.no_grad():
@@ -220,7 +222,7 @@ def compute_recall_iou_curve(model_wrapper, dataset, adv_mesh_ckpt, config,
         iou_thresholds: (T,) array
         recall_adv:     (T,) array
     """
-    from attack.whitebox import apply_attack_to_sample
+    from attack.whitebox import apply_attack_to_sample, load_mesh_checkpoint
 
     if devices is None:
         devices = [torch.device(device)]
@@ -228,11 +230,12 @@ def compute_recall_iou_curve(model_wrapper, dataset, adv_mesh_ckpt, config,
         wrappers = {devices[0]: model_wrapper}
     n_gpus = len(devices)
 
-    ckpt = torch.load(adv_mesh_ckpt, map_location='cpu', weights_only=False)
-    delta_v = ckpt['delta_v']
-    t_tilde = ckpt['t_tilde']
-    v0      = ckpt['v0']
-    faces   = ckpt['faces']
+    loaded = load_mesh_checkpoint(adv_mesh_ckpt, map_location='cpu')
+    mesh_param = loaded['mesh_param']
+    translation_param = loaded['translation_param']
+    v0 = loaded['v0']
+    faces = loaded['faces']
+    param_mode = loaded['param_mode']
 
     atk = config['attack']
     inj_cfg = atk['injection']
@@ -271,8 +274,9 @@ def compute_recall_iou_curve(model_wrapper, dataset, adv_mesh_ckpt, config,
         phantom_box = compute_phantom_box(inj_pos, phantom_size, phantom_yaw)
 
         pc_adv, _ = apply_attack_to_sample(
-            sample, delta_v, t_tilde, v0, faces, config, str(dev),
+            sample, mesh_param, translation_param, v0, faces, config, str(dev),
             injection_pos=inj_pos,
+            param_mode=param_mode,
         )
         pc_adv_t = torch.from_numpy(pc_adv.astype(np.float32)).to(dev)
         with torch.no_grad():

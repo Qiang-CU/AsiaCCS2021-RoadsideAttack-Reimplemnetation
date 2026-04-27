@@ -1,0 +1,90 @@
+data:
+  kitti_root: data/kitti
+  split: val
+  pc_range: [0.0, -40.0, -2.5, 70.4, 40.0, 1.0]
+
+model:
+  pointrcnn_config: /mnt/file-206-user-disk-m/cpii.local/qli/carbu/OpenPCDet/tools/cfgs/kitti_models/pointrcnn.yaml
+  pointrcnn_ckpt: model/checkpoint/pointrcnn_7870.pth
+  score_thresh: 0.3
+  nms_thresh: 0.1
+
+output:
+  save_dir: results/pointopt_engineering
+
+attack:
+  mode: whitebox
+  n_iters: 1000
+  lr: 0.02
+  optimizer: adam
+  mesh_subdivisions: 2
+  size_limit: [1.2, 0.8, 0.7]
+  translation_limit: [0.3, 0.3, 0.0]
+  grad_scale: 10.0
+
+  loss_weights:
+    kappa: 2.0
+    alpha_feat: 0.1
+    beta_loc: 0.5
+    beta_size: 0.0
+    lambda_lap: 0.001
+
+  multi_frame_batch: 8
+  phantom_box_size: [3.9, 1.6, 1.56]
+
+  mesh:
+    param_mode: mesh_offset
+    save_hit_points:
+      enabled: false
+      when: [apply]
+      subdir: debug_mesh_hits
+      max_files: 32
+
+  injection:
+    x_range: [5, 25]
+    y_range: [-10, 10]
+    resolution: 0.5
+    min_clearance: 1.5
+    fallback_pos: [4.0, -2.0, 0.0]
+    margin: 0.5
+
+  pointopt:
+    n_points: 1000
+    n_iters: 1500
+    lr: 0.01
+    multi_frame_batch: 8
+    init: box
+    lambda_uni: 0.001
+    physical:
+      enabled: true
+      lambda_cd: 0.1
+      lambda_knn: 0.05
+      lambda_nproj: 0.1
+      knn_k: 10
+      noise_sigma: 0.02
+
+  blackbox:
+    n_points: 200
+    init: gt
+    sigma0: 0.15
+    popsize: 48
+    maxiter: 300
+    tolfun: 1e-8
+    diagonal: true
+    n_eval_samples: 8
+
+  lidar:
+    n_elevation: 64
+    elev_min_deg: -24.9
+    elev_max_deg: 2.0
+    h_step_deg: 0.08
+    ray_margin_deg: 2.0
+
+eval:
+  iou_thresh: 0.1
+  iou_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+  proximity_thresh: 1.5
+
+ref_feature:
+  n_instances: 500
+  output_path: results/ref_car_feature.pt
