@@ -1,6 +1,6 @@
 # Attack configuration for AsiaCCS 2021 — Appearing Attack
-# Target: PointRCNN (white-box), PointPillar/PV-RCNN (black-box)
-# Design: single-stage RPN-level optimization (inspired by Tu et al. CVPR 2020)
+# White-box: PointRCNN (NMS → STE ROI pooling, gradient-based mesh optimization)
+# Black-box: PointPillar / PV-RCNN (genetic algorithm, no gradient required)
 
 data:
   kitti_root: data/kitti
@@ -8,95 +8,66 @@ data:
   pc_range: [0.0, -40.0, -2.5, 70.4, 40.0, 1.0]
 
 model:
-  pointrcnn_config: /mnt/file-206-user-disk-m/cpii.local/qli/carbu/OpenPCDet/tools/cfgs/kitti_models/pointrcnn.yaml
+  pointrcnn_config: /root/AsiaCCS2021-RoadsideAttack-Reimplemnetation/OpenPCDet/tools/cfgs/kitti_models/pointrcnn.yaml
   pointrcnn_ckpt: model/checkpoint/pointrcnn_7870.pth
+  pointpillar_config: /root/AsiaCCS2021-RoadsideAttack-Reimplemnetation/OpenPCDet/tools/cfgs/kitti_models/pointpillar.yaml
+  pointpillar_ckpt: model/checkpoint/pointpillar_7728.pth
   score_thresh: 0.3
-  nms_thresh: 0.1
 
 output:
   save_dir: results
 
 attack:
-  mode: whitebox          # whitebox or blackbox
-  n_iters: 1000
-  lr: 0.02
-  optimizer: adam
-  mesh_subdivisions: 2    # 162 vertices, 320 faces
-  size_limit: [1.2, 0.8, 0.7]     # meters half-extent — physical printing constraint
-  translation_limit: [0.3, 0.3, 0.0]
-  grad_scale: 10.0                # amplify gradient through differentiable renderer
+  n_iters: 5000
+  lr: 0.003
+  mesh_subdivisions: 3    # 642 vertices, 1280 faces
+  mesh_radius: 0.4        # icosphere initial radius ≈ min(size_limit)
+  size_limit: [0.45, 0.45, 0.41]  # 90x90x82cm half-extents (2x paper)
+  grad_scale: 10.0
+  n_views_per_step: 4
 
-  # Loss weights — single-stage, all RPN-level
-  # L = L_cls + beta_loc*L_loc + beta_size*L_size + alpha_feat*L_feat + lambda_lap*L_lap
   loss_weights:
-    kappa: 2.0             # CW margin (round1=5.0, round3: 降低让 L_cls 更早饱和)
-    alpha_feat: 0.1        # L_feat: pull backbone features toward real car features
-    beta_loc: 0.5          # L_loc: align RPN box centers to injection position (CRITICAL)
-    beta_size: 0.0         # L_size: 关闭 (round1=0.2, 实验证明不可优化)
-    lambda_lap: 0.001      # L_lap: Laplacian mesh smoothing (from CVPR 2020)
+    # Paper Eq. 10: L = L_cls + α*L_feat + β*L_box + γ*L_area
+    alpha_rpn: 0.1         # Weight for L_rpn_cls (RPN objectness)
+    alpha_feat: 0.1        # Weight for L_feat (backbone + RCNN feature matching)
+    beta_box: 0.1          # Weight for L_box (orientation + size matching)
+    gamma_area: -0.01      # Weight for L_area (maximize bottom area, negative = maximize)
+    kappa_rcnn: 0.0        # CW margin for RCNN cls loss
+    kappa_rpn: 0.0         # CW margin for RPN cls loss
 
-  multi_frame_batch: 8
-  phantom_box_size: [3.9, 1.6, 1.56]  # typical KITTI car dimensions (for L_size target)
+  # Object at (4,-2,0), LiDAR at random positions
+  object_pos: [4.0, -2.0, 0.0]
+  lidar_x_range: [-3.0, 3.0]
+  lidar_y_range: [-1.0, 1.0]
+  lidar_z_range: [0.7, 0.8]
 
-  mesh:
-    param_mode: mesh_offset   # mesh_offset or reparameterize
-    save_hit_points:
-      enabled: false
-      when: [apply]
-      subdir: debug_mesh_hits
-      max_files: 32
-
-  # Injection settings
-  injection:
-    x_range: [5, 25]
-    y_range: [-10, 10]
-    resolution: 0.5
-    min_clearance: 1.5
-    fallback_pos: [4.0, -2.0, 0.0]
-    margin: 0.5  # GT box margin in BEV occupancy
-
-  # Direct point optimisation settings
-  pointopt:
-    n_points: 1000          # 1000 points for denser coverage + better Poisson reconstruction
-    n_iters: 1500           # round3: 1500 warm-start from round1
-    lr: 0.01                # round3: 中等学习率 (round1=0.02)
-    multi_frame_batch: 8
-    init: box               # 'box' = complete closed car-surface box (all 6 faces)
-    lambda_uni: 0.001       # uniformity regulariser weight
-    # Physical realizability constraints (AAAI 2020 pipeline)
-    physical:
-      enabled: true         # Chamfer+kNN+NormalProj for printable objects
-      lambda_cd: 0.1        # Chamfer distance to initial shape
-      lambda_knn: 0.05      # kNN smoothing (uniform spacing for printability)
-      lambda_nproj: 0.1     # normal projection (prevent inward perturbation)
-      knn_k: 10             # k for kNN operations
-      noise_sigma: 0.02     # 点级别 EoT：每次前向给点坐标加 N(0, σ²) 噪声 (m)
-
-  # Black-box CMA-ES settings (direct point optimisation)
-  blackbox:
-    n_points: 200           # fewer than whitebox (400) for CMA-ES efficiency
-    init: gt                # 'gt' = from GT car scans, 'box' = car-surface box
-    sigma0: 0.15            # 直接点空间，无 sigmoid 压缩，不需要大 sigma
-    popsize: 48             # CMA-ES recommended ~4+3*ln(600)≈23, 48 足够
-    maxiter: 300
-    tolfun: 1e-8
-    diagonal: true          # CMA_diagonal 模式，高维搜索更高效
-    n_eval_samples: 8       # frames per candidate per generation (early-term 会跳过差的)
-
-  # LiDAR ray parameters (Velodyne HDL-64E)
+  # LiDAR ray parameters — Velodyne VLP-16 (paper Section 4.1)
   lidar:
-    n_elevation: 64
-    elev_min_deg: -24.9
-    elev_max_deg: 2.0
-    h_step_deg: 0.08
+    n_elevation: 16
+    elev_min_deg: -15.0
+    elev_max_deg: 15.0
+    h_step_deg: 0.2
     ray_margin_deg: 2.0
 
 eval:
-  iou_thresh: 0.1         # For appearing attack: low IoU with phantom box
+  iou_thresh: 0.1
   iou_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-  proximity_thresh: 1.5   # meters from injection pos
+  proximity_thresh: 1.5
 
-# Reference feature settings
+# Pose sweep evaluation (paper Table 3)
+pose_sweep:
+  object_pos: [4.0, -2.0, 0.0]
+  n_x: 30
+  n_y: 30
+  lidar_x_range: [-3.0, 3.0]
+  lidar_y_range: [-1.0, 1.0]
+  lidar_z: 0.75
+  background: ground
+  ground_z: -0.75
+
+# Reference feature paths
 ref_feature:
-  n_instances: 500
-  output_path: results/ref_car_feature.pt
+  backbone_path: results/ref_car_feature_backbone.pt
+  rcnn_path: results/ref_car_feature_rcnn.pt
+  orientations_path: results/ref_car_orientations.pt
+  box_size_path: results/ref_car_box_size.pt

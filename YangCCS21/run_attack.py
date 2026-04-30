@@ -1,27 +1,31 @@
 """
 Main entry point for the AsiaCCS 2021 appearing adversarial attack replication.
 
+Attack targets:
+  - White-box: PointRCNN (gradient-based mesh optimization)
+  - Black-box: PointPillar / PV-RCNN (genetic algorithm, no gradient)
+
 Usage:
-    # Phase 0: Test PointRCNN inference
+    # Test PointRCNN inference
     python run_attack.py --mode test_inference --device cuda:0
 
-    # Phase 3: Precompute reference car features
+    # Precompute reference car features
     python run_attack.py --mode precompute --device cuda:0
 
-    # Phase 5: White-box attack
+    # White-box attack (PointRCNN)
     python run_attack.py --mode whitebox --device cuda:0
 
-    # Phase 6: Black-box attack (CMA-ES, multi-GPU)
-    python run_attack.py --mode blackbox --gpu 0,1,2,3
+    # Black-box attack — genetic algorithm (PointPillar)
+    python run_attack.py --mode genetic --device cuda:0
 
-    # Phase 7: Evaluate ASR (multi-GPU)
+    # Black-box attack — hill-climbing (PointRCNN, exploratory)
+    python run_attack.py --mode hillclimb --device cuda:0
+
+    # Evaluate ASR (multi-GPU)
     python run_attack.py --mode eval --gpu 0,1,2,3 --ckpt results/adv_mesh_whitebox_final.pth
 
-    # Phase 7: Recall-IoU curve (multi-GPU)
-    python run_attack.py --mode recall_iou --gpu 0,1,2,3 --ckpt results/adv_mesh_whitebox_final.pth
-
-    # Phase 7: Defense evaluation (multi-GPU)
-    python run_attack.py --mode defenses --gpu 0,1,2,3 --ckpt results/adv_mesh_whitebox_final.pth
+    # Pose sweep evaluation (Table 3)
+    python run_attack.py --mode pose_sweep --ckpt results/adv_mesh_whitebox_final.pth
 """
 
 import os
@@ -133,28 +137,24 @@ def mode_test_inference(config, device):
 
 
 def mode_precompute(config, device):
-    """Phase 3: Precompute reference car features."""
+    """Precompute RPN-level reference car features."""
     print("=" * 60)
-    print("Phase 3: Precomputing reference car features")
+    print("Precomputing RPN-level reference car features")
     print("=" * 60)
 
-    # Delegate to precompute_features.py
     from precompute_features import main as precompute_main
     sys.argv = [
         'precompute_features.py',
         '--config', 'configs/attack_config.yaml',
-        '--n_instances', str(config.get('ref_feature', {}).get('n_instances', 500)),
         '--device', device,
-        '--output', config.get('ref_feature', {}).get('output_path', 'results/ref_car_feature.pt'),
     ]
     precompute_main()
 
 
 def mode_whitebox(config, device, warm_start_ckpt=None):
-    """Phase 5: White-box appearing attack (single-stage RPN optimization)."""
+    """White-box appearing attack on PointRCNN (paper Section 3.2)."""
     print("=" * 60)
-    print("Phase 5: White-box appearing attack (single-stage)")
-    print(f"  Size limit: {config['attack']['size_limit']}")
+    print("White-box appearing attack (PointRCNN)")
     print(f"  Loss weights: {config['attack']['loss_weights']}")
     if warm_start_ckpt:
         print(f"  Warm-start: {warm_start_ckpt}")
@@ -165,20 +165,26 @@ def mode_whitebox(config, device, warm_start_ckpt=None):
 
     from attack.whitebox import run_whitebox_attack
 
-    dataset = get_dataset(config)
-
-    mesh_param, translation_param, history = run_whitebox_attack(
-        dataset, config, save_dir=save_dir,
+    mesh_param, history = run_whitebox_attack(
+        None, config, save_dir=save_dir,
         warm_start_ckpt=warm_start_ckpt,
     )
 
     from evaluation.visualize import plot_loss_curve
-    loss_keys = {
-        'L_total': history['L_total'],
-        'L_cls': history['L_cls'],
-        'L_loc': history['L_loc'],
-    }
+    loss_keys = {k: v for k, v in history.items() if isinstance(v, list) and len(v) > 0}
     plot_loss_curve(loss_keys, save_path=os.path.join(save_dir, 'whitebox_loss.png'))
+
+
+def mode_hillclimb(config, device, warm_start_ckpt=None):
+    """Hill-climbing black-box attack — directly optimizes detection score."""
+    print("=" * 60)
+    print("Hill-climbing black-box attack (PointRCNN)")
+    print("=" * 60)
+    config['device'] = device
+    save_dir = get_save_dir(config)
+    from attack.hillclimb_attack import run_hillclimb
+    run_hillclimb(None, config, save_dir=save_dir,
+                  warm_start_ckpt=warm_start_ckpt)
 
 
 def mode_pointopt(config, device, warm_start_ckpt=None, devices=None):
@@ -717,13 +723,52 @@ def mode_eval_defenses(config, devices, ckpt_path):
         json.dump(defense_results, f, indent=2)
 
 
+def mode_pose_sweep(config, devices, ckpt_path, args):
+    """LiDAR pose sweep evaluation (AsiaCCS 2021, Table 3 protocol)."""
+    print("=" * 60)
+    print("Pose Sweep Evaluation (AsiaCCS 2021 Table 3)")
+    print(f"  Checkpoint: {ckpt_path}")
+    print("=" * 60)
+
+    from evaluation.pose_sweep import (
+        compute_pose_sweep_asr, plot_pose_sweep_heatmap,
+    )
+
+    save_dir = get_save_dir(config)
+
+    asr, stats = compute_pose_sweep_asr(
+        config=config,
+        adv_ckpt_path=ckpt_path,
+        ckpt_type=args.ckpt_type,
+        device=str(devices[0]),
+    )
+
+    os.makedirs(save_dir, exist_ok=True)
+    result_path = os.path.join(save_dir, 'pose_sweep_results.json')
+    with open(result_path, 'w') as f:
+        json.dump({
+            'asr': asr,
+            'asr_pct': stats['asr_pct'],
+            'n_total': stats['n_total'],
+            'n_detected': stats['n_detected'],
+            'n_no_hit': stats.get('n_no_hit', 0),
+            'dist_bins': stats['dist_bins'],
+            'checkpoint': ckpt_path,
+        }, f, indent=2, ensure_ascii=False)
+    print(f"\n  Results saved to {result_path}")
+
+    heatmap_path = os.path.join(save_dir, 'pose_sweep_heatmap.png')
+    plot_pose_sweep_heatmap(stats, config, save_path=heatmap_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description='AsiaCCS 2021 Appearing Attack')
     parser.add_argument('--mode', required=True,
                         choices=['test_inference', 'precompute', 'whitebox',
-                                 'pointopt', 'blackbox', 'eval',
+                                 'pointopt', 'hillclimb', 'genetic',
+                                 'blackbox', 'eval',
                                  'eval_pointopt', 'recall_iou', 'defenses',
-                                 'physical_verify'])
+                                 'physical_verify', 'pose_sweep'])
     parser.add_argument('--config', default='configs/attack_config.yaml')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--gpu', default=None,
@@ -737,6 +782,17 @@ def main():
     parser.add_argument('--sample-method', default='both',
                         choices=['closest', 'uniform', 'both'],
                         help='Sampling strategy: closest (AAAI20), uniform, or both')
+    # Pose sweep arguments
+    parser.add_argument('--n-distances', type=int, default=None,
+                        help='Distance steps for pose sweep (default: from config)')
+    parser.add_argument('--n-azimuths', type=int, default=None,
+                        help='Azimuth steps for pose sweep (default: from config)')
+    parser.add_argument('--background', default=None,
+                        choices=['ground', 'empty', 'kitti'],
+                        help='Background scene type for pose sweep')
+    parser.add_argument('--ckpt-type', default=None,
+                        choices=['mesh', 'pointopt'],
+                        help='Checkpoint type (auto-detected if omitted)')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -766,6 +822,15 @@ def main():
             sys.exit(1)
         devices = _parse_devices(args)
         mode_eval_pointopt(config, devices, args.ckpt)
+    elif args.mode == 'hillclimb':
+        mode_hillclimb(config, args.device, args.ckpt)
+    elif args.mode == 'genetic':
+        from attack.genetic_attack import run_genetic_attack
+        run_genetic_attack(
+            config_path=args.config,
+            output_dir=get_save_dir(config),
+            device=args.device,
+        )
     elif args.mode == 'blackbox':
         devices = _parse_devices(args)
         mode_blackbox(config, args.device, devices)
@@ -796,6 +861,12 @@ def main():
                              mesh_method=args.mesh_method,
                              n_resample=args.n_resample,
                              sample_method=args.sample_method)
+    elif args.mode == 'pose_sweep':
+        if not args.ckpt:
+            print("ERROR: --ckpt required for pose_sweep mode")
+            sys.exit(1)
+        devices = _parse_devices(args)
+        mode_pose_sweep(config, devices, args.ckpt, args)
 
 
 if __name__ == '__main__':

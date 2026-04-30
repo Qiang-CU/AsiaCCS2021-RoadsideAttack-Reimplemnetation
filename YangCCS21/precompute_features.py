@@ -1,12 +1,12 @@
 """
-Precompute reference car features from KITTI train split.
+Precompute reference car features for appearing attack (AsiaCCS 2021).
 
-For each car instance in KITTI train:
-- Crop the point cloud to the GT bounding box (with 0.2m margin)
-- Run a forward pass with that crop as a "fake scene"
-- Capture the hook feature from PointRCNN's RCNN head
-Average over N instances to get ref_feature (shape: D,).
-Save to results/ref_car_feature.pt
+Runs natural PointRCNN inference on synthetic car + ground scenes,
+collects features from proposals that overlap the car position:
+1. Backbone point features → ref_car_feature_backbone.pt
+2. RCNN penultimate features (from NMS proposals) → ref_car_feature_rcnn.pt
+3. RPN orientation → ref_car_orientations.pt
+4. RPN box size → ref_car_box_size.pt
 """
 
 import os
@@ -15,138 +15,210 @@ import argparse
 import numpy as np
 import torch
 import yaml
-from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.pointrcnn_wrapper import PointRCNNWrapper
-from utils.kitti_utils import KITTIDataset, get_bbox_lidar, count_points_in_bbox
 
 
-def crop_points_in_bbox(pc, bbox_lidar, margin=0.2):
-    """
-    Crop points inside a 3D bbox with margin.
+def generate_car_box_points(center, lwh=(3.9, 1.6, 1.56), n_points=500,
+                            yaw=0.0):
+    """Generate points on a car-shaped box surface."""
+    cx, cy, cz = center
+    l, w, h = lwh
+    points = []
+    rng = np.random.RandomState(0)
+    pts_per_face = n_points // 6
 
-    Args:
-        pc:          (N, 4) point cloud
-        bbox_lidar:  (7,) [cx, cy, cz, l, w, h, yaw]
-        margin:      extra padding in meters
+    for face in range(6):
+        if face == 0:
+            u = rng.uniform(-w/2, w/2, pts_per_face)
+            v = rng.uniform(-h/2, h/2, pts_per_face)
+            x = np.full(pts_per_face, l/2)
+            y, z = u, v
+        elif face == 1:
+            u = rng.uniform(-w/2, w/2, pts_per_face)
+            v = rng.uniform(-h/2, h/2, pts_per_face)
+            x = np.full(pts_per_face, -l/2)
+            y, z = u, v
+        elif face == 2:
+            u = rng.uniform(-l/2, l/2, pts_per_face)
+            v = rng.uniform(-h/2, h/2, pts_per_face)
+            x, z = u, v
+            y = np.full(pts_per_face, w/2)
+        elif face == 3:
+            u = rng.uniform(-l/2, l/2, pts_per_face)
+            v = rng.uniform(-h/2, h/2, pts_per_face)
+            x, z = u, v
+            y = np.full(pts_per_face, -w/2)
+        elif face == 4:
+            u = rng.uniform(-l/2, l/2, pts_per_face)
+            v = rng.uniform(-w/2, w/2, pts_per_face)
+            x, y = u, v
+            z = np.full(pts_per_face, h/2)
+        else:
+            u = rng.uniform(-l/2, l/2, pts_per_face)
+            v = rng.uniform(-w/2, w/2, pts_per_face)
+            x, y = u, v
+            z = np.full(pts_per_face, -h/2)
 
-    Returns:
-        cropped: (M, 4) points inside the bbox
-    """
-    cx, cy, cz, l, w, h, yaw = bbox_lidar
-    pts = pc[:, :3]
-    cos_y, sin_y = np.cos(-yaw), np.sin(-yaw)
-    dx = pts[:, 0] - cx
-    dy = pts[:, 1] - cy
-    local_x = cos_y * dx - sin_y * dy
-    local_y = sin_y * dx + cos_y * dy
-    local_z = pts[:, 2] - cz
+        pts = np.stack([x, y, z], axis=1)
+        points.append(pts)
 
-    mask = (
-        (np.abs(local_x) < l / 2 + margin) &
-        (np.abs(local_y) < w / 2 + margin) &
-        (np.abs(local_z) < h / 2 + margin)
-    )
-    return pc[mask]
+    pts_local = np.concatenate(points, axis=0)
+    if abs(yaw) > 1e-6:
+        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+        rot = np.array([[cos_y, -sin_y, 0],
+                        [sin_y, cos_y, 0],
+                        [0, 0, 1]])
+        pts_local = pts_local @ rot.T
+
+    pts_local[:, 0] += cx
+    pts_local[:, 1] += cy
+    pts_local[:, 2] += cz
+    return pts_local.astype(np.float32)
+
+
+def generate_ground_plane(n_points=10000, ground_z=-0.75):
+    x = np.random.exponential(scale=10.0, size=n_points * 3)
+    x = x[(x >= 0.0) & (x <= 40.0)]
+    if len(x) > n_points:
+        x = x[:n_points]
+    elif len(x) < n_points:
+        x = np.concatenate([x, np.random.uniform(0, 40, n_points - len(x))])
+    y = np.random.uniform(-20, 20, len(x))
+    z = np.full(len(x), ground_z) + np.random.normal(0, 0.02, len(x))
+    intensity = np.random.uniform(0, 0.5, len(x))
+    return np.stack([x, y, z, intensity], axis=1).astype(np.float32)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Precompute reference car features')
+    parser = argparse.ArgumentParser(
+        description='Precompute reference car features (backbone + RCNN)')
     parser.add_argument('--config', default='configs/attack_config.yaml')
-    parser.add_argument('--n_instances', type=int, default=500)
     parser.add_argument('--device', default='cuda:0')
-    parser.add_argument('--output', default='results/ref_car_feature.pt')
+    parser.add_argument('--n_views', type=int, default=50)
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs('results', exist_ok=True)
 
-    # Load PointRCNN
-    print("Loading PointRCNN...")
+    atk = config['attack']
+    object_pos = np.array(atk['object_pos'], dtype=np.float32)
+    ps_cfg = config.get('pose_sweep', {})
+    ground_z = ps_cfg.get('ground_z', -0.75)
+
     wrapper = PointRCNNWrapper(
         config_path=config['model']['pointrcnn_config'],
         ckpt_path=config['model']['pointrcnn_ckpt'],
         device=args.device,
+        enable_ste=False,
     )
 
-    # Load KITTI train split
-    print("Loading KITTI train split...")
-    dataset = KITTIDataset(
-        root=config['data']['kitti_root'],
-        split='train',
-        pc_range=config['data']['pc_range'],
-        filter_objs=True,
-    )
+    rng = np.random.RandomState(42)
+    backbone_feat_list = []
+    rcnn_feat_list = []
+    rpn_orient_list = []
+    rpn_box_size_list = []
 
-    features = []
-    n_collected = 0
+    print(f"Collecting features from {args.n_views} viewpoints...")
+    print(f"  Object at: {object_pos.tolist()}")
 
-    print(f"Collecting features from {args.n_instances} car instances...")
-    pbar = tqdm(total=args.n_instances, desc='Collecting car features')
+    for view_i in range(args.n_views):
+        lidar_x = rng.uniform(*atk['lidar_x_range'])
+        lidar_y = rng.uniform(*atk['lidar_y_range'])
+        lidar_z = rng.uniform(*atk['lidar_z_range'])
+        lidar_pos = np.array([lidar_x, lidar_y, lidar_z], dtype=np.float32)
+        rel_pos = object_pos - lidar_pos
 
-    for idx in range(len(dataset)):
-        if n_collected >= args.n_instances:
-            break
+        car_pts = generate_car_box_points(rel_pos, n_points=500)
+        car_pts_4 = np.column_stack([car_pts,
+                                     np.ones(len(car_pts), dtype=np.float32)])
+        ground = generate_ground_plane(ground_z=ground_z)
+        n_ground = len(ground)
+        scene = np.concatenate([ground, car_pts_4], axis=0)
+        scene_t = torch.from_numpy(scene).to(args.device)
 
-        sample = dataset[idx]
-        pc = sample['pointcloud']
-        gt_boxes = sample['gt_bboxes']
+        try:
+            with torch.no_grad():
+                result = wrapper.forward_with_grad(scene_t)
 
-        for bi, bbox in enumerate(gt_boxes):
-            if n_collected >= args.n_instances:
-                break
+            # Backbone features for car points
+            pf = result.get('point_features')
+            if pf is not None and pf.shape[0] > n_ground:
+                car_feats = pf[n_ground:].cpu()
+                backbone_feat_list.append(car_feats.mean(dim=0))
 
-            # Crop points around this car
-            cropped = crop_points_in_bbox(pc, bbox, margin=0.2)
-            if len(cropped) < 10:
-                continue
+            # RCNN features: find ROIs that overlap the car position
+            rois = result.get('rois')
+            rf = result.get('rcnn_features')
+            if rois is not None and rf is not None:
+                roi_boxes = rois[0]  # (m, 7)
+                roi_xy = roi_boxes[:, :2]
+                car_xy = torch.tensor(rel_pos[:2], device=roi_xy.device)
+                dists = torch.norm(roi_xy - car_xy.unsqueeze(0), dim=1)
+                near_mask = dists < 3.0
+                if near_mask.any():
+                    near_feats = rf[near_mask].cpu()
+                    rcnn_feat_list.append(near_feats.mean(dim=0))
 
-            # Run forward pass to capture RPN backbone features
-            pc_t = torch.from_numpy(cropped.astype(np.float32)).to(args.device)
-            try:
-                result = wrapper.forward_with_grad(pc_t)
-                # Use RPN backbone point_features (128-d), NOT RCNN hook (256-d).
-                # This must match the features used in L_feat during attack.
-                feat = result.get('point_features')
-                if feat is not None and feat.numel() > 0:
-                    feat_mean = feat.detach().mean(dim=0).cpu()
-                    if torch.isfinite(feat_mean).all():
-                        features.append(feat_mean)
-                        n_collected += 1
-                        pbar.update(1)
-            except Exception as e:
-                continue
+            # RPN box predictions for car points
+            rpn_box = result.get('rpn_box_preds')
+            if rpn_box is not None and rpn_box.shape[0] > n_ground:
+                car_rpn = rpn_box[n_ground:].cpu()
+                rpn_orient_list.append(float(car_rpn[:, 6].mean()))
+                rpn_box_size_list.append(car_rpn[:, 3:6].mean(dim=0))
 
-    pbar.close()
+        except Exception as e:
+            print(f"  View {view_i} failed: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
-    if not features:
-        print("ERROR: No features collected. Check model and data paths.")
+        if (view_i + 1) % 10 == 0:
+            print(f"  Processed {view_i+1}/{args.n_views}, "
+                  f"backbone={len(backbone_feat_list)}, "
+                  f"rcnn={len(rcnn_feat_list)}")
+
+    if not backbone_feat_list:
+        print("ERROR: No features collected.")
         sys.exit(1)
 
-    # Average all features
-    ref_feature = torch.stack(features).mean(dim=0)
-    print(f"\nReference feature shape: {ref_feature.shape}")
-    print(f"Feature norm: {ref_feature.norm().item():.4f}")
-    print(f"Feature range: [{ref_feature.min().item():.4f}, {ref_feature.max().item():.4f}]")
+    # Save backbone features
+    ref_feat = torch.stack(backbone_feat_list).mean(dim=0)
+    print(f"\nBackbone ref feature: shape={ref_feat.shape}, "
+          f"norm={ref_feat.norm():.4f}")
+    torch.save(ref_feat, 'results/ref_car_feature_backbone.pt')
+    print("Saved → results/ref_car_feature_backbone.pt")
 
-    # Sanity check: cosine similarity between random pairs
-    if len(features) >= 10:
-        sims = []
-        for i in range(min(50, len(features))):
-            for j in range(i+1, min(50, len(features))):
-                cos_sim = torch.nn.functional.cosine_similarity(
-                    features[i].unsqueeze(0), features[j].unsqueeze(0)
-                ).item()
-                sims.append(cos_sim)
-        print(f"Cosine similarity between car instances: "
-              f"mean={np.mean(sims):.3f}, std={np.std(sims):.3f}")
+    # Save RCNN features
+    if rcnn_feat_list:
+        ref_rcnn = torch.stack(rcnn_feat_list).mean(dim=0)
+        print(f"RCNN ref feature: shape={ref_rcnn.shape}, "
+              f"norm={ref_rcnn.norm():.4f}")
+        torch.save(ref_rcnn, 'results/ref_car_feature_rcnn.pt')
+        print("Saved → results/ref_car_feature_rcnn.pt")
+    else:
+        print("WARNING: No RCNN features collected (hook may not have fired)")
 
-    torch.save(ref_feature, args.output)
-    print(f"Saved reference feature → {args.output}")
+    # Save RPN orientation
+    rpn_orient = float(np.mean(rpn_orient_list)) if rpn_orient_list else 0.0
+    orient_dict = {'rpn_orientation': rpn_orient}
+    torch.save(orient_dict, 'results/ref_car_orientations.pt')
+    print(f"RPN orientation: {rpn_orient:.4f}")
+    print("Saved → results/ref_car_orientations.pt")
+
+    # Save RPN box size
+    if rpn_box_size_list:
+        ref_box_size = torch.stack(rpn_box_size_list).mean(dim=0)
+        torch.save(ref_box_size, 'results/ref_car_box_size.pt')
+        print(f"RPN box size (dx,dy,dz): {ref_box_size.tolist()}")
+        print("Saved → results/ref_car_box_size.pt")
+
+    wrapper.remove_hook()
+    print("\nDone.")
 
 
 if __name__ == '__main__':

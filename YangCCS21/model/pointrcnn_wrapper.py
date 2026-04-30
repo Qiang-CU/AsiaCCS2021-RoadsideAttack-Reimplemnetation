@@ -327,25 +327,20 @@ class PointRCNNWrapper:
         }
         return batch_dict
 
-    def forward_no_nms(self, batch_dict, rpn_only=False, run_post=True):
+    def forward_attack(self, batch_dict, rpn_only=False):
         """
-        Run PointRCNN forward pass, capturing outputs for white-box attack.
+        Differentiable forward pass for white-box attack.
 
-        Args:
-            batch_dict:  from build_batch_dict()
-            rpn_only:    if True, stop after PointHeadBox (skip RCNN head).
-                         ~2x faster. Use for Stage 1 optimization.
-            run_post:    if True, run post_processing for monitoring metrics.
-                         Set False to skip (saves ~10% per step).
+        NMS naturally produces top-m proposals (m=NMS_POST_MAXSIZE, default 100).
+        STE ROI pooling gathers backbone features with gradient for these proposals.
 
-        Returns:
-            dict with RPN outputs, and RCNN outputs if rpn_only=False.
+        Returns dict with:
+          RPN: point_cls_scores, point_features, rpn_box_preds, point_cls_logits
+          RCNN: rcnn_cls_preds (1,m,1), rcnn_box_preds (1,m,7), rois (1,m,7),
+                roi_scores (1,m), rcnn_features (m,D)
         """
         self.last_feature = None
 
-        # OpenPCDet custom CUDA ops (e.g. pointnet2_utils) use
-        # torch.cuda.*Tensor() which allocates on current_device.
-        # Must match self.device to avoid cross-device errors.
         if self.device.type == 'cuda':
             torch.cuda.set_device(self.device)
 
@@ -356,23 +351,25 @@ class PointRCNNWrapper:
         rpn_result = {}
         with torch.set_grad_enabled(True):
             for cur_module in self.model.module_list:
-                batch_dict = cur_module(batch_dict)
                 mod_name = cur_module.__class__.__name__
+
+                batch_dict = cur_module(batch_dict)
+
                 if mod_name == 'PointHeadBox':
                     rpn_result['point_cls_scores'] = batch_dict.get('point_cls_scores')
                     rpn_result['point_features'] = batch_dict.get('point_features')
                     rpn_result['rpn_cls_preds'] = batch_dict.get('batch_cls_preds')
                     rpn_result['rpn_box_preds'] = batch_dict.get('batch_box_preds')
                     pf = batch_dict['point_features']
-                    logits = cur_module.cls_layers(pf)  # (N, num_class)
-                    logits_max, _ = logits.max(dim=-1)  # (N,)
+                    logits = cur_module.cls_layers(pf)
+                    logits_max, _ = logits.max(dim=-1)
                     rpn_result['point_cls_logits'] = logits_max
                     if rpn_only:
                         break
 
         result = {
             **rpn_result,
-            'features': self.last_feature,
+            'rcnn_features': self.last_feature,
         }
 
         if not rpn_only:
@@ -382,28 +379,24 @@ class PointRCNNWrapper:
                 result['rcnn_box_preds'] = batch_dict['batch_box_preds']
             if 'rois' in batch_dict:
                 result['rois'] = batch_dict['rois']
-
-        if run_post and not rpn_only:
-            with torch.no_grad():
-                pred_dicts, _ = self.model.post_processing(batch_dict)
-            result['pred_dicts'] = pred_dicts
+            if 'roi_scores' in batch_dict:
+                result['roi_scores'] = batch_dict['roi_scores']
 
         return result
 
-    def forward_with_grad(self, points_tensor, rpn_only=False, run_post=True):
+    def forward_with_grad(self, points_tensor, rpn_only=False):
         """
-        Convenience: build batch + forward, returning raw predictions.
+        Convenience: build batch + forward_attack.
 
         Args:
             points_tensor: (N, 4) float tensor with requires_grad on relevant portion
             rpn_only:      skip RCNN head for faster Stage 1
-            run_post:      run post_processing for monitoring
 
         Returns:
-            same as forward_no_nms
+            same as forward_attack
         """
         batch_dict = self.build_batch_dict(points_tensor)
-        return self.forward_no_nms(batch_dict, rpn_only=rpn_only, run_post=run_post)
+        return self.forward_attack(batch_dict, rpn_only=rpn_only)
 
     def detect_batch(self, points_list, score_thresh=0.3):
         """

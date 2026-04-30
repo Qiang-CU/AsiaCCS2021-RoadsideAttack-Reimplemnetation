@@ -284,8 +284,7 @@ def _forward_one_frame(wrapper, dataset, frame_idx, injection_cache,
 
     n_scene = merged_pc.shape[0] - n_adv
 
-    result = wrapper.forward_with_grad(merged_pc, rpn_only=rpn_only,
-                                       run_post=run_post)
+    result = wrapper.forward_with_grad(merged_pc, rpn_only=rpn_only)
     return {
         'result': result,
         'n_scene': n_scene,
